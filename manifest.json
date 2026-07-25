@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.collaboration_orchestrator",
+  "version": "1.0.0",
+  "main": "src/main.js",
+  "display_name": {
+    "zh": "多 Agent 开发调度器",
+    "en": "Collaboration Plugin"
+  },
+  "description": {
+    "zh": "多 Agent 编排器。支持多 Agent 并行开发、父子任务委托、消息传递和中断，使用 SQLite 持久化。",
+    "en": "Multi-agent orchestrator. Supports parallel multi-agent development, parent-child task delegation, messaging, and interruption with SQLite persistence."
+  },
+  "enabled_by_default": true,
+  "subpackages": [
+    {
+      "id": "collaboration",
+      "entry": "src/packages/collaboration.js",
+      "enabled_by_default": true,
+      "display_name": {
+        "zh": "Agent 协作工具",
+        "en": "Agent Collaboration Tools"
+      },
+      "description": {
+        "zh": "提供六个独立实现的协作接口，基于 SQLite Event Store 持久化。支持多 Agent 并行调度、父子任务委托、消息传递、中断和后续任务，含 request_id 幂等、副作用幂等和执行 epoch 恢复。全局最多 6 个活动 Run，单根最多 3 个。",
+        "en": "Provides six independently-implemented collaboration APIs with SQLite persistence. Supports parallel multi-agent scheduling, parent-child task delegation, messaging, interruption, and follow-up tasks, with request_id idempotency, side-effect idempotency, and execution-epoch recovery. Global concurrency six, per-root three."
+      }
+    },
+    {
+      "id": "tool_lifecycle_probe",
+      "entry": "src/packages/tool_lifecycle_probe.js",
+      "enabled_by_default": true,
+      "display_name": {
+        "zh": "工具生命周期探针与文件网关",
+        "en": "Tool Lifecycle Probe & File Gateway"
+      },
+      "description": {
+        "zh": "工具生命周期探针与文件网关。探针注册 hook 记录工具调用和 prompt compose 事件用于诊断。文件网关通过 prompt compose hook 按 Agent 身份裁剪可用工具列表，默认不限制，可按需注册白名单或黑名单。所有状态仅存于内存，重启后丢失。",
+        "en": "Tool lifecycle probe and file gateway. The probe registers hooks to record tool-call and prompt-compose events for diagnostics. The file gateway filters available tools per agent identity via the prompt-compose hook; by default no tools are restricted, with optional allow/deny list registration. All state lives in memory and is lost on restart."
+      }
+    }
+  ]
+}
