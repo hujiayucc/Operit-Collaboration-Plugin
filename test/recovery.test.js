@@ -113,13 +113,14 @@ treeRoot.requestFingerprint = JSON.stringify({
   name: "agent_tree_root",
   parent_agent_id: "",
   parent_chat_id: "",
+  include_conversation_context: false,
   workspace_path: "",
   workspace_env: "android",
   target_paths: [],
   read_only: true,
   priority: "normal",
   timeout_ms: 30000,
-  max_tool_calls: 4,
+  max_tool_calls: null,
 });
 treeRoot.executions[0].rootAgentId = treeRoot.id;
 treeRoot.executions[0].rootRunId = treeRoot.executions[0].id;

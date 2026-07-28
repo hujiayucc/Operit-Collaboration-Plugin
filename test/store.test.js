@@ -9,14 +9,24 @@ function createAndroidDb() {
   let closed = false;
   let transactionSuccessful = false;
   let failurePredicate = () => false;
+  let inListLimit = Infinity;
+
+  function enforceInListLimit(sql) {
+    for (const match of String(sql).matchAll(/\bIN\s*\(([^)]*)\)/gi)) {
+      const count = match[1].trim() ? match[1].split(",").length : 0;
+      if (count > inListLimit) throw new Error(`SQLite IN list exceeds test limit: ${count}`);
+    }
+  }
 
   function rowsFor(sql) {
+    enforceInListLimit(sql);
     return database.prepare(String(sql)).all().map((row) => Object.values(row));
   }
 
   return {
     execSQL(sql) {
       const text = String(sql);
+      enforceInListLimit(text);
       if (failurePredicate(text)) throw new Error(`injected SQLite failure: ${text}`);
       database.exec(text);
     },
@@ -66,6 +76,9 @@ function createAndroidDb() {
     },
     setFailure(predicate) {
       failurePredicate = predicate || (() => false);
+    },
+    setInListLimit(limit) {
+      inListLimit = Number.isFinite(limit) ? limit : Infinity;
     },
     isClosed() {
       return closed;
@@ -161,6 +174,32 @@ function sampleSnapshot() {
   };
 }
 
+function batchSnapshot(count) {
+  const agents = [];
+  for (let index = 0; index < count; index += 1) {
+    const agent = JSON.parse(JSON.stringify(sampleSnapshot().agents[0]));
+    const agentId = `batch_agent_${index}`;
+    const runId = `batch_run_${index}`;
+    const epoch = `${agentId}:1:1`;
+    agent.id = agentId;
+    agent.parentChatId = `batch_chat_${index}`;
+    agent.targetPaths = [`/workspace/batch_${index}.txt`];
+    agent.inbox[0].id = `batch_message_${index}`;
+    agent.events[0].id = `batch_event_${index}`;
+    agent.events[0].agent_id = agentId;
+    agent.events[0].execution_id = runId;
+    agent.events[0].data.epoch = epoch;
+    agent.executions[0].id = runId;
+    agent.executions[0].agentId = agentId;
+    agent.executions[0].epoch = epoch;
+    agent.executions[0].rootAgentId = agentId;
+    agent.executions[0].rootRunId = runId;
+    agent.currentExecutionId = runId;
+    agents.push(agent);
+  }
+  return { schema_version: 1, saved_at: 1234, agents };
+}
+
 let activeDb = createAndroidDb();
 global.Java = {
   getApplicationContext() {
@@ -207,6 +246,21 @@ test("event store creates schema v3 and round-trips relational projections", () 
   assert.deepEqual(loaded.agents, snapshot.agents);
   store.close();
   assert.equal(activeDb.isClosed(), true);
+});
+
+test("global settings metadata persists in the event store", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  const value = JSON.stringify({
+    max_concurrent_agents: 3,
+    max_active_runs_per_root: 2,
+    max_tool_calls: 18,
+    max_model_retries: 5,
+    conversation_context_mode: "on",
+  });
+  store.setMeta("collaboration_settings_v1", value);
+  assert.equal(store.getMeta("collaboration_settings_v1"), value);
+  store.close();
 });
 
 test("events and checkpoints are append-only while projections and revision advance", () => {
@@ -338,6 +392,29 @@ test("failed incremental save rolls back the selected projection and revision", 
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM events WHERE event_id = 'event_incremental_rollback'"), 0);
   assert.equal(store.load().agents[0].name, "writer");
 });
+
+test("incremental save keeps late events with earlier timestamps and ignores duplicate IDs", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  store.save(sampleSnapshot());
+
+  const changed = sampleSnapshot().agents[0];
+  changed.events.push({
+    id: "event_late",
+    type: "late_event",
+    agent_id: "agent_1",
+    execution_id: "execution_1",
+    run_seq: 1,
+    created_at: 90,
+    data: { late: true },
+  });
+  store.saveAgent(changed);
+  store.saveAgent(changed);
+
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM events WHERE event_id = 'event_late'"), 1);
+  assert.equal(activeDb.scalar("SELECT created_at FROM events WHERE event_id = 'event_late'"), 90);
+});
+
 
 test("incremental save updates only selected agents and appends new rows once", () => {
   activeDb = createAndroidDb();
@@ -633,6 +710,90 @@ test("opening schema v3 marks prepared effects unknown without re-executing them
   }).disposition, "blocked");
 });
 
+test("event store deletes Agent-owned projections and ledgers atomically", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  const snapshot = sampleSnapshot();
+  snapshot.agents[0].status = "completed";
+  snapshot.agents[0].executions[0].status = "completed";
+  snapshot.agents[0].executions[0].physicalStatus = "terminal";
+  snapshot.agents[0].executions[0].completedAt = 200;
+  store.save(snapshot);
+  store.commitRequest({
+    requestId: "delete_projection_request",
+    operation: "spawn_agent",
+    fingerprint: "fingerprint",
+    result: { agent: { id: "agent_1" } },
+  });
+  store.prepareEffect({
+    execution_epoch: "agent_1:1:1",
+    checkpoint_step: 1,
+    operation: "write_file",
+    request_hash: "delete_projection_effect",
+  });
+
+  assert.equal(store.deleteAgents(["agent_1"]), 1);
+  for (const table of ["agents", "runs", "run_attempts", "messages", "events", "checkpoints", "path_claims", "side_effects", "request_ledger"]) {
+    assert.equal(activeDb.scalar(`SELECT COUNT(*) FROM ${table}`), 0, `${table} must be cleared`);
+  }
+  assert.equal(store.load().agents.length, 0);
+});
+
+
+test("event store batches large Agent deletion cascades in one transaction", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  const snapshot = batchSnapshot(501);
+  store.save(snapshot);
+  activeDb.setInListLimit(500);
+
+  const requestedIds = snapshot.agents.map((agent) => agent.id);
+  requestedIds.push("batch_agent_0", "", "missing_agent");
+  assert.equal(store.deleteAgents(requestedIds), 501);
+  for (const table of ["agents", "runs", "run_attempts", "messages", "events", "checkpoints", "path_claims"]) {
+    assert.equal(activeDb.scalar(`SELECT COUNT(*) FROM ${table}`), 0, `${table} must be cleared`);
+  }
+});
+
+
+test("event store rolls back batched Agent deletion when a later batch fails", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  const snapshot = batchSnapshot(501);
+  store.save(snapshot);
+  let agentDeleteBatch = 0;
+  activeDb.setFailure((sql) => {
+    if (!sql.startsWith("DELETE FROM agents WHERE agent_id IN")) return false;
+    agentDeleteBatch += 1;
+    return agentDeleteBatch === 2;
+  });
+
+  assert.throws(
+    () => store.deleteAgents(snapshot.agents.map((agent) => agent.id)),
+    /injected SQLite failure/
+  );
+  activeDb.setFailure(null);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM agents"), 501);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM runs"), 501);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM run_attempts"), 501);
+});
+
+
+test("event store rolls back Agent deletion when a cascade step fails", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  store.save(sampleSnapshot());
+  const revision = store.revision;
+  activeDb.setFailure((sql) => sql.startsWith("DELETE FROM runs"));
+  assert.throws(() => store.deleteAgents(["agent_1"]), /injected SQLite failure/);
+  activeDb.setFailure(null);
+  assert.equal(store.revision, revision);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM agents"), 1);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM runs"), 1);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM run_attempts"), 1);
+});
+
+
 test("memory event store clones state and follows attempt and effect semantics", () => {
   const store = memoryStore("SQLite unavailable");
   const snapshot = sampleSnapshot();
@@ -669,6 +830,10 @@ test("memory event store clones state and follows attempt and effect semantics",
     operation: "write_file",
     request_hash: "missing_memory_hash",
   }), /execution epoch not found/);
+  assert.equal(store.deleteAgents(["agent_1"]), 1);
+  assert.equal(store.load().agents.length, 0);
+  assert.equal(store.listAttempts("execution_1").length, 0);
+  assert.equal(store.getEffect(prepared.effect.effectKey), null);
 });
 
 test("event store reports why SQLite is unavailable", () => {

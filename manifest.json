@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "toolpkg_id": "com.operit.collaboration_orchestrator",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "src/main.js",
   "display_name": {
-    "zh": "多 Agent 开发调度器",
-    "en": "Collaboration Plugin"
+    "zh": "多 Agent 协作调度器",
+    "en": "Multi-Agent Collaboration Orchestrator"
   },
   "description": {
-    "zh": "多 Agent 编排器。支持多 Agent 并行开发、父子任务委托、消息传递和中断，使用 SQLite 持久化。",
-    "en": "Multi-agent orchestrator. Supports parallel multi-agent development, parent-child task delegation, messaging, and interruption with SQLite persistence."
+    "zh": "面向分析、开发、审查、测试和后台跟踪的多 Agent 协作调度器。提供父子任务委托、消息传递、等待、续作、中断、原生控制台，以及生命周期诊断和提示词阶段工具过滤。优先使用 SQLite Event Store；不可用时回退内存并在响应中标明。工具网关只过滤 Agent 的可见工具，不是操作系统权限沙箱，也不拦截已发出的调用。",
+    "en": "Multi-agent collaboration orchestrator for analysis, development, review, testing, and background tracking. It provides parent-child delegation, messaging, waiting, follow-up runs, interruption, a native dashboard, lifecycle diagnostics, and prompt-time tool filtering. It prefers SQLite Event Store and reports an in-memory fallback when SQLite is unavailable. The gateway filters tools visible to Agents; it is not an OS permission sandbox and does not intercept already-issued calls."
   },
   "enabled_by_default": true,
   "subpackages": [
@@ -22,8 +22,8 @@
         "en": "Agent Collaboration Tools"
       },
       "description": {
-        "zh": "提供六个独立实现的协作接口，基于 SQLite Event Store 持久化。支持多 Agent 并行调度、父子任务委托、消息传递、中断和后续任务，含 request_id 幂等、副作用幂等和执行 epoch 恢复。全局最多 6 个活动 Run，单根最多 3 个。",
-        "en": "Provides six independently-implemented collaboration APIs with SQLite persistence. Supports parallel multi-agent scheduling, parent-child task delegation, messaging, interruption, and follow-up tasks, with request_id idempotency, side-effect idempotency, and execution-epoch recovery. Global concurrency six, per-root three."
+        "zh": "提供六个协作工具，用于创建与跟踪 Agent、投递消息、续接终态 Run、等待和中断。Agent、Run、消息和检查点优先持久化到 SQLite Event Store schema v3，SQLite 不可用时响应会标明内存回退。spawn、send、followup 和 interrupt 支持 request_id 幂等；执行 epoch 隔离恢复与迟到结果。全局活动 Run 可配置为 1–16，单根任务树活动槽可配置为 1–8，单根上限不高于全局上限。宿主 AI 瞬时故障自动重试 0–12 次，默认 5 次；余额、认证、参数和策略错误不重试。写路径和只读标记仅用于调度检查及提示约束，不构成操作系统权限隔离。",
+        "en": "Provides six tools to create and track agents, deliver messages, continue terminal Runs, wait, and interrupt. Agents, Runs, messages, and checkpoints prefer SQLite Event Store schema v3, with responses reporting an in-memory fallback when SQLite is unavailable. Spawn, send, follow-up, and interrupt support request_id idempotency; execution epochs isolate recovery and late results. Global active Runs are configurable from 1 to 16 and per-root active slots from 1 to 8, with the per-root limit no higher than the global limit. Transient host AI failures are retried 0-12 times, default 5; balance, authentication, parameter, and policy errors are not retried. Write paths and read-only flags are scheduling and prompt constraints, not OS permission isolation."
       }
     },
     {
@@ -31,12 +31,12 @@
       "entry": "src/packages/tool_lifecycle_probe.js",
       "enabled_by_default": true,
       "display_name": {
-        "zh": "工具生命周期探针与文件网关",
-        "en": "Tool Lifecycle Probe & File Gateway"
+        "zh": "工具生命周期探针与 Agent 工具网关",
+        "en": "Tool Lifecycle Probe & Agent Tool Gateway"
       },
       "description": {
-        "zh": "工具生命周期探针与文件网关。探针注册 hook 记录工具调用和 prompt compose 事件用于诊断。文件网关通过 prompt compose hook 按 Agent 身份裁剪可用工具列表，默认不限制，可按需注册白名单或黑名单。所有状态仅存于内存，重启后丢失。",
-        "en": "Tool lifecycle probe and file gateway. The probe registers hooks to record tool-call and prompt-compose events for diagnostics. The file gateway filters available tools per agent identity via the prompt-compose hook; by default no tools are restricted, with optional allow/deny list registration. All state lives in memory and is lost on restart."
+        "zh": "提供七个诊断与 Agent 工具网关工具。生命周期探针记录宿主 hook 字段和协作运行时明确绑定的 Agent 工具调用；诊断缓冲仅存内存，重启丢失。网关在 prompt compose 阶段过滤可见工具，并在公开插件工具的 IPC 执行入口校验调用上下文，阻止 Agent、summary 和 finalization 通过动态包激活调用固定隐藏工具。非空白名单优先，宿主缺少工具列表时关闭式返回空列表。",
+        "en": "Provides seven diagnostic and Agent tool-gateway tools. The lifecycle probe records host-hook fields and Agent tool invocations explicitly attributed by the collaboration runtime; diagnostic buffers are in memory and lost on restart. The gateway filters visible tools at prompt-compose time and validates caller context at public plugin-tool IPC entry points, preventing Agent, summary, and finalization contexts from invoking fixed-hidden tools through dynamic package activation. A non-empty allow list takes precedence and fails closed when the host omits the tool list."
       }
     }
   ]

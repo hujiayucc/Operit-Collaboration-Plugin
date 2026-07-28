@@ -5,6 +5,7 @@ const test = require("node:test");
 
 const handlers = new Map();
 const registeredHooks = {};
+const registeredUiModules = [];
 
 class PromptTurn {
   constructor(kind, content, toolName, metadata) {
@@ -93,6 +94,9 @@ global.ToolPkg = {
       return h(payload);
     },
   },
+  registerPromptHistoryHook(definition) {
+    registeredHooks.promptHistory = definition.function;
+  },
   registerToolPromptComposeHook(definition) {
     registeredHooks.toolPrompt = definition.function;
   },
@@ -100,14 +104,181 @@ global.ToolPkg = {
   registerToolLifecycleHook(definition) {
     registeredHooks.toolLifecycle = definition.function;
   },
+  registerToolboxUiModule(definition) {
+    registeredUiModules.push(definition);
+  },
 };
 
 const plugin = require("../src/main.js");
-// main registers collaboration (6), probe (4), and gateway (3) IPC handlers.
-assert.equal(handlers.size, 13, "main must register collaboration, probe and gateway IPC handlers at module load");
-assert.equal(typeof plugin.onToolPromptCompose, "function", "registered hook must be exported");
+// main registers collaboration (6 public + 6 UI-only), probe (4), and gateway (3) IPC handlers.
+assert.equal(handlers.size, 19, "main must register collaboration, UI, settings, probe and gateway IPC handlers at module load");
+assert.equal(typeof plugin.onPromptHistory, "function", "prompt history hook must be exported");
+assert.equal(typeof plugin.onToolPromptCompose, "function", "tool prompt hook must be exported");
 plugin.registerToolPkg();
+assert.equal(registeredHooks.promptHistory, plugin.onPromptHistory);
 assert.equal(registeredHooks.toolPrompt, plugin.onToolPromptCompose);
+assert.equal(typeof handlers.get("collaboration.get_settings"), "function");
+assert.equal(typeof handlers.get("collaboration.update_settings"), "function");
+assert.equal(typeof handlers.get("collaboration.delete_agent"), "function");
+assert.equal(typeof handlers.get("collaboration.clear_history"), "function");
+assert.equal(registeredUiModules.length, 1);
+assert.equal(registeredUiModules[0].id, "collaboration_dashboard_v101");
+assert.equal(registeredUiModules[0].runtime, "compose_dsl");
+assert.equal(typeof registeredUiModules[0].screen, "function");
+
+test("registration-mode UI placeholders keep their serializable module path", () => {
+  function placeholderScreen() {}
+  placeholderScreen.__operit_toolpkg_module_path =
+    "src/ui/collaboration_dashboard/index.ui.js";
+
+  assert.equal(plugin.resolveDashboardScreen(placeholderScreen), placeholderScreen);
+  assert.equal(
+    plugin.resolveDashboardScreen(placeholderScreen).__operit_toolpkg_module_path,
+    "src/ui/collaboration_dashboard/index.ui.js"
+  );
+});
+
+test("normal CommonJS UI exports resolve through default", () => {
+  function exportedScreen() {}
+  assert.equal(
+    plugin.resolveDashboardScreen({ default: exportedScreen, Screen: exportedScreen }),
+    exportedScreen
+  );
+});
+
+test("prompt history hook caches only user and assistant conversation turns", () => {
+  const event = {
+    eventPayload: {
+      chatId: "parent_chat_context",
+      rawInput: "current user request",
+      chatHistory: [
+        { kind: "SYSTEM", content: "private system" },
+        { kind: "USER", content: "earlier request" },
+        { kind: "TOOL_RESULT", content: "private tool output" },
+        { kind: "ASSISTANT", content: "earlier answer" },
+      ],
+      availableTools: ["read_file"],
+    },
+  };
+  assert.equal(plugin.onPromptHistory(event), null);
+  assert.deepEqual(plugin.getConversationHistory("parent_chat_context"), [
+    { kind: "USER", content: "earlier request" },
+    { kind: "ASSISTANT", content: "earlier answer" },
+    { kind: "USER", content: "current user request" },
+  ]);
+});
+
+test("prompt history hook normalizes chat history before deduplicating the current input", () => {
+  const event = {
+    eventPayload: {
+      chatId: "parent_chat_context_with_trailing_tool",
+      rawInput: "current user request",
+      chatHistory: [
+        { kind: "USER", content: "current user request" },
+        { kind: "TOOL_CALL", content: "private tool call" },
+      ],
+      preparedHistory: [],
+      availableTools: ["read_file"],
+    },
+  };
+  assert.equal(plugin.onPromptHistory(event), null);
+  assert.deepEqual(plugin.getConversationHistory("parent_chat_context_with_trailing_tool"), [
+    { kind: "USER", content: "current user request" },
+  ]);
+});
+
+test("prompt history hook upgrades the same chat snapshot across before and after prepare stages", () => {
+  const chatId = "parent_staged_context";
+  assert.equal(plugin.onPromptHistory({
+    eventPayload: {
+      stage: "before_prepare_history",
+      chatId,
+      processedInput: "current staged request",
+      chatHistory: [
+        { kind: "USER", content: "earlier staged request" },
+        { kind: "ASSISTANT", content: "earlier staged answer" },
+      ],
+      preparedHistory: [],
+    },
+  }), null);
+  assert.deepEqual(plugin.getConversationHistory(chatId), [
+    { kind: "USER", content: "earlier staged request" },
+    { kind: "ASSISTANT", content: "earlier staged answer" },
+    { kind: "USER", content: "current staged request" },
+  ]);
+
+  assert.equal(plugin.onPromptHistory({
+    eventPayload: {
+      stage: "after_prepare_history",
+      chatId,
+      processedInput: "current staged request",
+      chatHistory: [
+        { kind: "USER", content: "earlier staged request" },
+        { kind: "ASSISTANT", content: "earlier staged answer" },
+      ],
+      preparedHistory: [
+        { kind: "SYSTEM", content: "private staged system" },
+        { kind: "USER", content: "earlier staged request" },
+        { kind: "ASSISTANT", content: "earlier staged answer" },
+        { kind: "USER", content: "current staged request" },
+      ],
+    },
+  }), null);
+  assert.deepEqual(plugin.getConversationHistory(chatId), [
+    { kind: "USER", content: "earlier staged request" },
+    { kind: "ASSISTANT", content: "earlier staged answer" },
+    { kind: "USER", content: "current staged request" },
+  ]);
+});
+
+test("prompt history hook uses prepared history when chat history is empty", () => {
+  const event = {
+    eventPayload: {
+      chatId: "parent_prepared_context",
+      rawInput: "current prepared request",
+      chatHistory: [],
+      preparedHistory: [
+        { kind: "SYSTEM", content: "private system" },
+        { kind: "USER", content: "prepared request" },
+        { kind: "TOOL_CALL", content: "private tool call" },
+        { kind: "ASSISTANT", content: "prepared answer" },
+        { kind: "TOOL_RESULT", content: "private tool output" },
+        { kind: "USER", content: "current prepared request" },
+      ],
+      availableTools: ["read_file"],
+    },
+  };
+  assert.equal(plugin.onPromptHistory(event), null);
+  assert.deepEqual(plugin.getConversationHistory("parent_prepared_context"), [
+    { kind: "USER", content: "prepared request" },
+    { kind: "ASSISTANT", content: "prepared answer" },
+    { kind: "USER", content: "current prepared request" },
+  ]);
+});
+
+test("prompt history hook prefers prepared history instead of duplicating both history sources", () => {
+  const event = {
+    eventPayload: {
+      chatId: "parent_dual_context",
+      processedInput: "latest request",
+      chatHistory: [
+        { kind: "USER", content: "raw request" },
+        { kind: "ASSISTANT", content: "raw answer" },
+      ],
+      preparedHistory: [
+        { kind: "USER", content: "prepared request" },
+        { kind: "ASSISTANT", content: "prepared answer" },
+      ],
+      availableTools: ["read_file"],
+    },
+  };
+  assert.equal(plugin.onPromptHistory(event), null);
+  assert.deepEqual(plugin.getConversationHistory("parent_dual_context"), [
+    { kind: "USER", content: "prepared request" },
+    { kind: "ASSISTANT", content: "prepared answer" },
+    { kind: "USER", content: "latest request" },
+  ]);
+});
 
 test("spawn_agent and wait_agent complete a read-only task", async () => {
   const started = await handlers.get("collaboration.spawn_agent")({
@@ -125,6 +296,14 @@ test("spawn_agent and wait_agent complete a read-only task", async () => {
   assert.equal(completed.success, true);
   assert.equal(completed.agents[0].status, "completed");
   assert.ok(completed.agents[0].execution.tool_count >= 1, "agent must have used at least one tool");
+  const probeStatus = plugin.probeGetStatus({});
+  assert.ok(probeStatus.runtime_attributed_events >= 1);
+  assert.ok(probeStatus.agent_attributed_events >= 1);
+  const invocation = plugin.probeGetLog({ tool_name: "read_file" }).entries.find(
+    (entry) => entry.attributed_agent_id === started.agent.id && entry.attribution_source === "runtime_callback"
+  );
+  assert.ok(invocation, "manager tool callback must attribute the invocation to the active Agent");
+  assert.equal(invocation.execution_epoch, completed.agents[0].execution.epoch);
 });
 
 test("interrupt_agent on a terminal agent returns already_terminal", async () => {

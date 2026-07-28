@@ -1,8 +1,8 @@
 "use strict";
 
-const TOOL_BLOCK = /<(tool(?:_[A-Za-z0-9]+)?)\b[\s\S]*?<\/\1>/gi;
+const TOOL_BLOCK = /<(tool(?:_[A-Za-z0-9]+)?)\b([^>]*)>([\s\S]*?)<\/\1>/gi;
 const TOOL_SELF_CLOSING = /<tool(?:_[A-Za-z0-9]+)?\b[^>]*\/>/gi;
-const TOOL_RESULT_BLOCK = /<(tool_result(?:_[A-Za-z0-9]+)?)\b[\s\S]*?<\/\1>/gi;
+const TOOL_RESULT_BLOCK = /<(tool_result(?:_[A-Za-z0-9]+)?)\b[^>]*>([\s\S]*?)<\/\1>/gi;
 const TOOL_RESULT_SELF = /<tool_result(?:_[A-Za-z0-9]+)?\b[^>]*\/>/gi;
 const UNMATCHED_TOOL_LIKE_TAG = /<tool(?:_result)?(?:_[A-Za-z0-9]+)?\b/i;
 const TOOL_BLOCK_MARKER = "\u0000OPERIT_TOOL_BLOCK\u0000";
@@ -14,7 +14,7 @@ const PROMPT_ECHO_MARKERS = Object.freeze([
   "在提供最终答案之前，你必须使用",
 ]);
 const MESSAGE_ACK_LINE = /^\s*COLLABORATION_MESSAGE_ACKS:\s*(\[[^\r\n]*\])\s*$/gim;
-const CONTROL_MARKER = /^\s*COLLABORATION_CONTROL:\s*/gim;
+const CONTROL_MARKER = /^[\t ]*COLLABORATION_CONTROL:[\t ]*/gim;
 const CONTROL_ACTIONS = new Set(["progress", "finish", "fail"]);
 const CONTROL_VERSION = 1;
 const SUPPRESSED_PROMPT_ECHO_RESULT = "Agent output was suppressed because it reproduced internal instructions.";
@@ -83,6 +83,60 @@ function pathsOverlap(left, right) {
   return isSameOrParent(a, b) || isSameOrParent(b, a);
 }
 
+function toolAttribute(attributes, name) {
+  const escaped = String(name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = `\\b${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>\x60]+))`;
+  const match = String(attributes || "").match(new RegExp(pattern, "i"));
+  return match ? String(match[1] ?? match[2] ?? match[3] ?? "").trim() : "";
+}
+
+function extractToolReceipts(value) {
+  const source = String(value || "");
+  const tools = [];
+  const results = [];
+  TOOL_BLOCK.lastIndex = 0;
+  let match;
+  while ((match = TOOL_BLOCK.exec(source)) !== null) {
+    const name = toolAttribute(match[2], "name");
+    if (!name) continue;
+    TOOL_RESULT_BLOCK.lastIndex = 0;
+    const nested = TOOL_RESULT_BLOCK.exec(match[3]);
+    tools.push({
+      name,
+      start: match.index,
+      end: TOOL_BLOCK.lastIndex,
+      hasResult: !!nested,
+      result: nested ? String(nested[2] || "").trim() : "",
+    });
+  }
+  TOOL_RESULT_BLOCK.lastIndex = 0;
+  while ((match = TOOL_RESULT_BLOCK.exec(source)) !== null) {
+    results.push({
+      start: match.index,
+      end: TOOL_RESULT_BLOCK.lastIndex,
+      result: String(match[2] || "").trim(),
+      used: false,
+    });
+  }
+  for (let index = 0; index < tools.length; index += 1) {
+    const tool = tools[index];
+    if (tool.hasResult) {
+      const nestedResult = results.find((result) => result.start >= tool.start && result.end <= tool.end);
+      if (nestedResult) nestedResult.used = true;
+      continue;
+    }
+    const nextToolStart = tools[index + 1]?.start ?? Number.POSITIVE_INFINITY;
+    const adjacent = results.find((result) => !result.used && result.start >= tool.end && result.start < nextToolStart);
+    if (!adjacent) continue;
+    adjacent.used = true;
+    tool.hasResult = true;
+    tool.result = adjacent.result;
+  }
+  TOOL_BLOCK.lastIndex = 0;
+  TOOL_RESULT_BLOCK.lastIndex = 0;
+  return tools.map(({ name, hasResult, result }) => ({ name, hasResult, result }));
+}
+
 function cleanAgentResult(raw) {
   const source = String(raw || "").replace(THINK_TAG, "").replace(SEARCH_TAG, "");
   const marked = source
@@ -125,9 +179,17 @@ function redactPromptEcho(value) {
   return text;
 }
 
+function maskToolBlocks(value) {
+  return String(value || "")
+    .replace(TOOL_RESULT_BLOCK, (match) => " ".repeat(match.length))
+    .replace(TOOL_RESULT_SELF, (match) => " ".repeat(match.length))
+    .replace(TOOL_BLOCK, (match) => " ".repeat(match.length))
+    .replace(TOOL_SELF_CLOSING, (match) => " ".repeat(match.length));
+}
+
 function controlMarkers(value) {
   const matches = [];
-  const text = String(value || "");
+  const text = maskToolBlocks(value);
   CONTROL_MARKER.lastIndex = 0;
   let match;
   while ((match = CONTROL_MARKER.exec(text)) !== null) {
@@ -266,6 +328,7 @@ module.exports = {
   clipText,
   createId,
   errorText,
+  extractToolReceipts,
   hasFinalTextAfterTool,
   isPathWithin,
   looksLikePromptEcho,

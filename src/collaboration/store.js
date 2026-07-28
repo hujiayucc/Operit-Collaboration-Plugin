@@ -8,6 +8,7 @@ const PREVIOUS_EVENT_STORE_SCHEMA_VERSION = 2;
 const STATE_SCHEMA_VERSION = 3;
 const MAX_LOADED_EVENTS = 300;
 const MAX_LOADED_EXECUTIONS = 30;
+const SQLITE_BATCH_SIZE = 500;
 
 const SCHEMA_SQL = [
   [
@@ -150,6 +151,23 @@ function cloneSnapshot(snapshot) {
   return snapshot ? JSON.parse(JSON.stringify(snapshot)) : null;
 }
 
+function requestResultReferencesAgentIds(value, agentIds, key = "") {
+  if (Array.isArray(value)) {
+    return value.some((item) => requestResultReferencesAgentIds(item, agentIds, key));
+  }
+  if (!value || typeof value !== "object") {
+    return typeof value === "string" && agentIds.has(value) && [
+      "id",
+      "agent_id",
+      "parent_agent_id",
+      "root_agent_id",
+    ].includes(key);
+  }
+  return Object.entries(value).some(([childKey, childValue]) =>
+    requestResultReferencesAgentIds(childValue, agentIds, childKey)
+  );
+}
+
 function normalizeEffectRequest(input) {
   if (!input || typeof input !== "object") throw new Error("effect request must be an object");
   const executionEpoch = String(input.execution_epoch || input.executionEpoch || "").trim();
@@ -197,6 +215,7 @@ function memoryStore(reason = "", initialSnapshot = null, migration = "") {
   const attempts = new Map();
   const effects = new Map();
   const requests = new Map();
+  const meta = new Map();
 
   function projectAttempts(snapshot, target = attempts) {
     for (const agent of Array.isArray(snapshot && snapshot.agents) ? snapshot.agents : []) {
@@ -328,6 +347,46 @@ function memoryStore(reason = "", initialSnapshot = null, migration = "") {
       current = next;
       projectAttempts(delta);
       revision += 1;
+    },
+    deleteAgents(agentIds) {
+      const ids = new Set((Array.isArray(agentIds) ? agentIds : []).map((id) => String(id || "").trim()).filter(Boolean));
+      if (ids.size === 0) return 0;
+      const removed = (Array.isArray(current && current.agents) ? current.agents : [])
+        .filter((agent) => agent && ids.has(agent.id));
+      if (removed.length === 0) return 0;
+      const removedRunIds = new Set();
+      const removedEpochs = new Set();
+      for (const agent of removed) {
+        for (const execution of Array.isArray(agent.executions) ? agent.executions : []) {
+          if (execution && execution.id) removedRunIds.add(execution.id);
+          if (execution && execution.epoch) removedEpochs.add(execution.epoch);
+        }
+      }
+      current = cloneSnapshot(current) || { schema_version: STATE_SCHEMA_VERSION, saved_at: now(), agents: [] };
+      current.agents = (Array.isArray(current.agents) ? current.agents : [])
+        .filter((agent) => agent && !ids.has(agent.id));
+      current.saved_at = now();
+      for (const [key, record] of attempts) {
+        if (ids.has(record.agentId) || removedRunIds.has(record.runId)) attempts.delete(key);
+      }
+      for (const [key, effect] of effects) {
+        if (removedEpochs.has(effect.executionEpoch)) effects.delete(key);
+      }
+      for (const [key, request] of requests) {
+        if (requestResultReferencesAgentIds(request.result, ids)) requests.delete(key);
+      }
+      revision += 1;
+      return removed.length;
+    },
+    getMeta(key) {
+      return meta.get(String(key || "").trim()) || "";
+    },
+    setMeta(key, value) {
+      const normalizedKey = String(key || "").trim();
+      if (!normalizedKey) throw new Error("meta key is required");
+      meta.set(normalizedKey, String(value ?? ""));
+      revision += 1;
+      return meta.get(normalizedKey);
     },
     getRequest(requestId, operation) {
       return cloneSnapshot(requests.get(`${String(operation || "").trim()}:${String(requestId || "").trim()}`) || null);
@@ -463,6 +522,32 @@ function queryRows(db, sql, columns) {
         cursor.close();
       } catch (_) {}
     }
+  }
+}
+
+function valueBatches(values) {
+  const batches = [];
+  for (let index = 0; index < values.length; index += SQLITE_BATCH_SIZE) {
+    batches.push(values.slice(index, index + SQLITE_BATCH_SIZE));
+  }
+  return batches;
+}
+
+function queryColumnInBatches(db, table, selectedColumn, filterColumn, values) {
+  const rows = [];
+  for (const batch of valueBatches(values)) {
+    rows.push(...queryRows(
+      db,
+      `SELECT ${selectedColumn} FROM ${table} WHERE ${filterColumn} IN (${batch.map(sqliteLiteral).join(", ")})`,
+      [selectedColumn]
+    ).map(([value]) => value));
+  }
+  return rows;
+}
+
+function deleteInBatches(db, table, column, values) {
+  for (const batch of valueBatches(values)) {
+    db.execSQL(`DELETE FROM ${table} WHERE ${column} IN (${batch.map(sqliteLiteral).join(", ")})`);
   }
 }
 
@@ -842,13 +927,8 @@ function writeIncrementalAgentInTransaction(db, agent, revision) {
     );
   }
 
-  const eventWatermark = Number(queryRows(
-    db,
-    `SELECT MAX(created_at) FROM events WHERE agent_id = ${sqliteLiteral(agent.id)}`,
-    ["created_at"]
-  )[0]?.[0]) || 0;
   for (const event of Array.isArray(agent.events) ? agent.events : []) {
-    if (!event || !event.id || Number(event.created_at) < eventWatermark) continue;
+    if (!event || !event.id) continue;
     db.execSQL(
       `INSERT OR IGNORE INTO events (` +
       `event_id, agent_id, run_id, run_seq, event_type, payload_json, event_json, revision, created_at` +
@@ -1070,6 +1150,55 @@ function createSqliteStore(db, initialized) {
       if (incoming.length === 0) return;
       transactionalWrite((committedRevision) => {
         for (const agent of incoming) writeIncrementalAgentInTransaction(db, agent, committedRevision);
+      });
+    },
+    deleteAgents(agentIds) {
+      const ids = Array.from(new Set(
+        (Array.isArray(agentIds) ? agentIds : []).map((id) => String(id || "").trim()).filter(Boolean)
+      ));
+      if (ids.length === 0) return 0;
+      return transactionalWrite(() => {
+        const existing = queryColumnInBatches(db, "agents", "agent_id", "agent_id", ids).sort();
+        if (existing.length === 0) return 0;
+        const existingSet = new Set(existing);
+        const runIds = Array.from(new Set(queryColumnInBatches(db, "runs", "run_id", "agent_id", existing)));
+        const epochs = Array.from(new Set(queryColumnInBatches(
+          db,
+          "run_attempts",
+          "execution_epoch",
+          "agent_id",
+          existing
+        )));
+        deleteInBatches(db, "side_effects", "execution_epoch", epochs);
+        for (const table of ["checkpoints", "run_attempts", "events", "runs"]) {
+          deleteInBatches(db, table, "run_id", runIds);
+        }
+        for (const table of ["messages", "events", "path_claims"]) {
+          deleteInBatches(db, table, "agent_id", existing);
+        }
+        for (const [requestKey, json] of queryRows(
+          db,
+          "SELECT request_key, result_json FROM request_ledger ORDER BY request_key",
+          ["request_key", "result_json"]
+        )) {
+          const request = parseJsonRow(json, "request ledger");
+          if (requestResultReferencesAgentIds(request.result, existingSet)) {
+            db.execSQL(`DELETE FROM request_ledger WHERE request_key = ${sqliteLiteral(requestKey)}`);
+          }
+        }
+        deleteInBatches(db, "agents", "agent_id", existing);
+        return existing.length;
+      });
+    },
+    getMeta(key) {
+      return queryMeta(db, String(key || "").trim());
+    },
+    setMeta(key, value) {
+      const normalizedKey = String(key || "").trim();
+      if (!normalizedKey) throw new Error("meta key is required");
+      return transactionalWrite(() => {
+        writeMeta(db, normalizedKey, String(value ?? ""), now());
+        return String(value ?? "");
       });
     },
     getRequest(requestId, operation) {

@@ -1,11 +1,72 @@
 "use strict";
 
 const { CHANNELS } = require("./protocol.js");
-const { SUMMARY_CHAT_PREFIX: COLLAB_SUMMARY_CHAT_PREFIX, AGENT_CHAT_PREFIX: COLLAB_AGENT_CHAT_PREFIX } = require("./collaboration/engine.js");
+const {
+  SUMMARY_CHAT_PREFIX: COLLAB_SUMMARY_CHAT_PREFIX,
+  AGENT_CHAT_PREFIX: COLLAB_AGENT_CHAT_PREFIX,
+  FINALIZATION_CHAT_PREFIX: COLLAB_FINALIZATION_CHAT_PREFIX,
+  actionGateToolAllowed,
+} = require("./collaboration/engine.js");
 const { createCollaborationManager } = require("./collaboration/manager.js");
 
 let ipcRegistered = false;
-const collaboration = createCollaborationManager();
+let dashboardUiRegistered = false;
+let dashboardUiRegistrationError = "";
+const conversationHistoryByChat = new Map();
+const MAX_CONTEXT_CACHE_CHATS = 24;
+const MAX_CONTEXT_CACHE_TURNS = 40;
+const MAX_CONTEXT_CACHE_CHARS = 32000;
+
+function snapshotConversationHistory(history) {
+  const source = Array.isArray(history) ? history.slice(-MAX_CONTEXT_CACHE_TURNS) : [];
+  const reversed = [];
+  let remaining = MAX_CONTEXT_CACHE_CHARS;
+  for (let index = source.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const turn = source[index] || {};
+    const kind = String(turn.kind || "").trim().toUpperCase();
+    if (kind !== "USER" && kind !== "ASSISTANT") continue;
+    let content = String(turn.content || "").trim();
+    if (!content) continue;
+    if (content.length > remaining) content = content.slice(content.length - remaining);
+    reversed.push({ kind, content });
+    remaining -= content.length;
+  }
+  return reversed.reverse();
+}
+
+function rememberConversationHistory(chatId, chatHistory, preparedHistory, currentInput) {
+  const id = String(chatId || "").trim();
+  if (!id || id.startsWith(COLLAB_AGENT_CHAT_PREFIX) || id.startsWith(COLLAB_SUMMARY_CHAT_PREFIX) ||
+    id.startsWith(COLLAB_FINALIZATION_CHAT_PREFIX)) return;
+  const preparedSnapshot = snapshotConversationHistory(preparedHistory);
+  const combined = preparedSnapshot.length > 0
+    ? preparedSnapshot
+    : snapshotConversationHistory(chatHistory);
+  const input = String(currentInput || "").trim();
+  const last = combined[combined.length - 1];
+  if (input && (!last || String(last.kind || "").toUpperCase() !== "USER" || String(last.content || "").trim() !== input)) {
+    combined.push({ kind: "USER", content: input });
+  }
+  const snapshot = snapshotConversationHistory(combined);
+  if (snapshot.length === 0) return;
+  conversationHistoryByChat.delete(id);
+  conversationHistoryByChat.set(id, snapshot);
+  while (conversationHistoryByChat.size > MAX_CONTEXT_CACHE_CHATS) {
+    conversationHistoryByChat.delete(conversationHistoryByChat.keys().next().value);
+  }
+}
+
+function getConversationHistory(chatId) {
+  const snapshot = conversationHistoryByChat.get(String(chatId || "").trim()) || [];
+  return snapshot.map((turn) => ({ ...turn }));
+}
+
+const collaboration = createCollaborationManager({
+  getConversationContext: getConversationHistory,
+  onAgentToolInvocation(details) {
+    if (typeof probeRecordAgentToolInvocation === "function") probeRecordAgentToolInvocation(details);
+  },
+});
 
 function cancelAllRuns() {
   collaboration.shutdown();
@@ -15,52 +76,183 @@ function cancelAllRuns() {
 function registerIpc() {
   if (ipcRegistered) return;
   ipcRegistered = true;
-  ToolPkg.ipc.on(CHANNELS.SPAWN_AGENT, async (payload) => collaboration.spawn(payload));
-  ToolPkg.ipc.on(CHANNELS.LIST_AGENTS, async (payload) => collaboration.list(payload));
-  ToolPkg.ipc.on(CHANNELS.SEND_MESSAGE, async (payload) => collaboration.sendMessage(payload));
-  ToolPkg.ipc.on(CHANNELS.FOLLOWUP_TASK, async (payload) => collaboration.followup(payload));
-  ToolPkg.ipc.on(CHANNELS.WAIT_AGENT, async (payload) => collaboration.wait(payload));
-  ToolPkg.ipc.on(CHANNELS.INTERRUPT_AGENT, async (payload) => collaboration.interrupt(payload));
-  ToolPkg.ipc.on(CHANNELS.PROBE_GET_STATUS, async (payload) => probeGetStatus(payload));
-  ToolPkg.ipc.on(CHANNELS.PROBE_GET_LOG, async (payload) => probeGetLog(payload));
-  ToolPkg.ipc.on(CHANNELS.PROBE_CLEAR_LOG, async (payload) => probeClearLog(payload));
-  ToolPkg.ipc.on(CHANNELS.PROBE_GET_PROMPT_COMPOSE_LOG, async (payload) => probeGetPromptComposeLog(payload));
+  ToolPkg.ipc.on(CHANNELS.SPAWN_AGENT, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return collaboration.spawn(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.LIST_AGENTS, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return collaboration.list(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.SEND_MESSAGE, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return collaboration.sendMessage(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.FOLLOWUP_TASK, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return collaboration.followup(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.WAIT_AGENT, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return collaboration.wait(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.INTERRUPT_AGENT, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return collaboration.interrupt(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.INSPECT_AGENT, async (payload) => collaboration.inspect(payload));
+  ToolPkg.ipc.on(CHANNELS.LIST_TREE, async (payload) => collaboration.listTree(payload));
+  ToolPkg.ipc.on(CHANNELS.GET_SETTINGS, async () => collaboration.getSettings());
+  ToolPkg.ipc.on(CHANNELS.UPDATE_SETTINGS, async (payload) => collaboration.updateSettings(payload));
+  ToolPkg.ipc.on(CHANNELS.DELETE_AGENT, async (payload) => collaboration.deleteAgent(payload));
+  ToolPkg.ipc.on(CHANNELS.CLEAR_HISTORY, async () => collaboration.clearHistory());
+  ToolPkg.ipc.on(CHANNELS.PROBE_GET_STATUS, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return probeGetStatus(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.PROBE_GET_LOG, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return probeGetLog(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.PROBE_CLEAR_LOG, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return probeClearLog(payload);
+  });
+  ToolPkg.ipc.on(CHANNELS.PROBE_GET_PROMPT_COMPOSE_LOG, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return probeGetPromptComposeLog(payload);
+  });
   ToolPkg.ipc.on(CHANNELS.GATEWAY_REGISTER, async (payload) => {
+    assertPublicPluginToolCaller(payload);
     registerFileGateway(payload && payload.agent_id, payload || {});
     return fileGatewayStatus();
   });
   ToolPkg.ipc.on(CHANNELS.GATEWAY_UNREGISTER, async (payload) => {
+    assertPublicPluginToolCaller(payload);
     unregisterFileGateway(payload && payload.agent_id);
     return fileGatewayStatus();
   });
-  ToolPkg.ipc.on(CHANNELS.GATEWAY_STATUS, async () => fileGatewayStatus());
+  ToolPkg.ipc.on(CHANNELS.GATEWAY_STATUS, async (payload) => {
+    assertPublicPluginToolCaller(payload);
+    return fileGatewayStatus();
+  });
 }
 
 registerIpc();
 
-// File gateway: allows per-agent tool filtering via prompt compose hook.
-// By default NO tools are denied — agents have access to the full toolset.
-// Callers can register a policy with allowed_tools_json or denied_tools_json
-// to restrict specific agents when needed.
+// Agent tool gateway: filters prompt-time tools and protects its own controls.
+// Ordinary non-plugin tools are unrestricted unless a per-agent policy narrows them.
 const fileGatewayAgents = new Map(); // agentId -> { allowedTools: Set, deniedTools: Set }
-const DEFAULT_DENIED_TOOLS = []; // empty: agents get all tools by default
+const DEFAULT_DENIED_TOOLS = []; // empty: agents get all non-plugin tools by default
 const FILE_GATEWAY_AGENT_PREFIX = "CollaborationAgent:";
+const AGENT_HIDDEN_TOOL_NAMES = new Set([
+  "spawn_agent",
+  "list_agents",
+  "send_message",
+  "followup_task",
+  "wait_agent",
+  "interrupt_agent",
+  "probe_get_status",
+  "probe_get_log",
+  "probe_clear_log",
+  "probe_get_prompt_compose_log",
+  "gateway_register",
+  "gateway_unregister",
+  "gateway_status",
+]);
+const AGENT_HIDDEN_TOOL_PREFIXES = ["collaboration:", "tool_lifecycle_probe:"];
+
+function gatewayCallerIsAgent(callerChatId) {
+  const caller = String(callerChatId || "").trim();
+  return caller.startsWith(COLLAB_AGENT_CHAT_PREFIX) || caller.startsWith(COLLAB_SUMMARY_CHAT_PREFIX) ||
+    caller.startsWith(COLLAB_FINALIZATION_CHAT_PREFIX);
+}
+
+function assertPublicPluginToolCaller(payload) {
+  if (gatewayCallerIsAgent(payload && payload.caller_chat_id)) {
+    throw new Error("collaboration, probe and gateway tools cannot be called from collaboration agent, summary or finalization contexts");
+  }
+}
+
+function toolNameOf(tool) {
+  return typeof tool === "string" ? tool : String(tool && tool.name || "");
+}
+
+function isAgentHiddenTool(name) {
+  const toolName = String(name || "");
+  return AGENT_HIDDEN_TOOL_NAMES.has(toolName) ||
+    AGENT_HIDDEN_TOOL_PREFIXES.some((prefix) => toolName.startsWith(prefix));
+}
+
+function filterAgentTools(tools, policy, actionGate = null) {
+  return tools.filter((tool) => {
+    const name = toolNameOf(tool);
+    if (isAgentHiddenTool(name)) return false;
+    if (!actionGateToolAllowed(actionGate, name)) return false;
+    if (policy && policy.allowedTools.size > 0) return policy.allowedTools.has(name);
+    if (policy && policy.deniedTools.has(name)) return false;
+    return !DEFAULT_DENIED_TOOLS.includes(name);
+  });
+}
+
+function agentHiddenToolNames() {
+  const names = [...AGENT_HIDDEN_TOOL_NAMES];
+  return names.concat(names.map((name) =>
+    `${name.startsWith("probe_") || name.startsWith("gateway_") ? "tool_lifecycle_probe" : "collaboration"}:${name}`
+  ));
+}
+
+function gatewayDecision(currentTools, policy, actionGate = null) {
+  if (Array.isArray(currentTools)) {
+    const filtered = filterAgentTools(currentTools, policy, actionGate);
+    return {
+      result: { availableTools: filtered },
+      action: policy ? "filter" : "hide_plugin_tools",
+      count: filtered.length,
+    };
+  }
+  if (actionGate) {
+    return { result: { availableTools: [] }, action: `action_gate_${actionGate.kind}_unenforceable`, count: 0 };
+  }
+  if (policy && policy.allowedTools.size > 0) {
+    return { result: { availableTools: [] }, action: "allowlist_unenforceable", count: 0 };
+  }
+  const denied = new Set([
+    ...agentHiddenToolNames(),
+    ...DEFAULT_DENIED_TOOLS,
+    ...(policy ? policy.deniedTools : []),
+  ]);
+  return {
+    result: { deniedTools: [...denied] },
+    action: policy ? "deny" : "hide_plugin_tools",
+    count: -1,
+  };
+}
+
+function parseFileGatewayTools(value, fieldName) {
+  if (value === undefined || value === null || value === "") return [];
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (error) {
+      throw new Error(`${fieldName} must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${fieldName} must be a string array`);
+  }
+  return Array.from(new Set(parsed.map((item) => item.trim()).filter(Boolean)));
+}
 
 function registerFileGateway(agentId, config) {
   const id = String(agentId || "").trim();
-  if (!id) return;
+  if (!id) throw new Error("agent_id is required");
   const cfg = config || {};
-  // Accept both array (allowed_tools/denied_tools) and JSON string (allowed_tools_json/denied_tools_json) forms
-  let allowedRaw = cfg.allowed_tools;
-  if (!Array.isArray(allowedRaw) && cfg.allowed_tools_json) {
-    try { allowedRaw = JSON.parse(cfg.allowed_tools_json); } catch (_) { allowedRaw = []; }
-  }
-  let deniedRaw = cfg.denied_tools;
-  if (!Array.isArray(deniedRaw) && cfg.denied_tools_json) {
-    try { deniedRaw = JSON.parse(cfg.denied_tools_json); } catch (_) { deniedRaw = []; }
-  }
-  const allowed = new Set(Array.isArray(allowedRaw) ? allowedRaw.map(String) : []);
-  const denied = new Set(Array.isArray(deniedRaw) ? deniedRaw.map(String) : []);
+  const allowedRaw = cfg.allowed_tools !== undefined ? cfg.allowed_tools : cfg.allowed_tools_json;
+  const deniedRaw = cfg.denied_tools !== undefined ? cfg.denied_tools : cfg.denied_tools_json;
+  const allowed = new Set(parseFileGatewayTools(allowedRaw, "allowed_tools"));
+  const denied = new Set(parseFileGatewayTools(deniedRaw, "denied_tools"));
   fileGatewayAgents.set(id, { allowedTools: allowed, deniedTools: denied });
 }
 
@@ -76,12 +268,40 @@ function fileGatewayStatus() {
       denied_tools: [...config.deniedTools].sort(),
     };
   }
-  return JSON.stringify({
+  return {
     success: true,
     gateway: "file_gateway",
     default_denied_tools: [...DEFAULT_DENIED_TOOLS].sort(),
+    fixed_hidden_tools: agentHiddenToolNames().sort(),
+    execution_guard: "caller_chat_id",
     registered_agents: agents,
-  }, null, 2);
+  };
+}
+
+function onPromptHistory(event) {
+  const payload = event && event.eventPayload ? event.eventPayload : {};
+  rememberConversationHistory(
+    payload.chatId,
+    payload.chatHistory,
+    payload.preparedHistory,
+    payload.processedInput || payload.rawInput
+  );
+  return null;
+}
+
+function applyAgentGateway(agentId, currentTools, source) {
+  const policy = fileGatewayAgents.get(agentId);
+  const actionGate = collaboration.getActionGate(agentId);
+  const decision = gatewayDecision(currentTools, policy, actionGate);
+  try {
+    probeUpdateLastPromptComposeEntry({
+      gateway_action: actionGate
+        ? `action_gate_${actionGate.kind}_by_${source}`
+        : `${decision.action}_by_${source}`,
+      gateway_returned_tools: decision.count,
+    });
+  } catch (_) {}
+  return decision.result;
 }
 
 function onToolPromptCompose(event) {
@@ -102,52 +322,27 @@ function onToolPromptCompose(event) {
     return { availableTools: [] };
   }
 
-  // File gateway: identify collaboration agent calls by the AGENT_CHAT_PREFIX
-  // in chatId. The engine sets chatId = "collaboration_agent:<agent_id>" for
-  // agent task calls, making them distinguishable from user chats without
-  // relying on proxySenderName (which the host does not expose to JS hooks).
-  if (chatId.startsWith(COLLAB_AGENT_CHAT_PREFIX)) {
-    const agentId = chatId.slice(COLLAB_AGENT_CHAT_PREFIX.length);
-    const policy = fileGatewayAgents.get(agentId);
-    if (policy) {
-      const currentTools = Array.isArray(payload.availableTools) ? payload.availableTools : null;
-      if (currentTools) {
-        const filtered = currentTools.filter((tool) => {
-          const name = typeof tool === "string" ? tool : String(tool && tool.name || "");
-          if (policy.allowedTools.size > 0) return policy.allowedTools.has(name);
-          if (policy.deniedTools.has(name)) return false;
-          return !DEFAULT_DENIED_TOOLS.includes(name);
-        });
-        try { probeUpdateLastPromptComposeEntry({ gateway_action: "filter_by_chatid", gateway_returned_tools: filtered.length }); } catch (_) {}
-        return { availableTools: filtered };
-      }
-      const denied = new Set([...policy.deniedTools, ...DEFAULT_DENIED_TOOLS]);
-      try { probeUpdateLastPromptComposeEntry({ gateway_action: "deny_by_chatid", gateway_returned_tools: -1 }); } catch (_) {}
-      return { deniedTools: [...denied] };
-    }
-    try { probeUpdateLastPromptComposeEntry({ gateway_action: "agent_no_policy", gateway_returned_tools: -1 }); } catch (_) {}
+  // Agent calls are identified by chatId when available, with proxySenderName as fallback.
+  if (chatId.startsWith(COLLAB_FINALIZATION_CHAT_PREFIX)) {
+    try { probeUpdateLastPromptComposeEntry({ gateway_action: "finalization_strip", gateway_returned_tools: 0 }); } catch (_) {}
+    return { availableTools: [] };
   }
 
-  // Fallback: if proxySenderName is available (future host versions), use it.
+  if (chatId.startsWith(COLLAB_AGENT_CHAT_PREFIX)) {
+    const agentId = chatId.slice(COLLAB_AGENT_CHAT_PREFIX.length);
+    return applyAgentGateway(
+      agentId,
+      payload.availableTools,
+      "chatid"
+    );
+  }
+
   if (proxySender.startsWith(FILE_GATEWAY_AGENT_PREFIX)) {
-    const agentId = proxySender.slice(FILE_GATEWAY_AGENT_PREFIX.length);
-    const policy = fileGatewayAgents.get(agentId);
-    if (policy) {
-      const currentTools = Array.isArray(payload.availableTools) ? payload.availableTools : null;
-      if (currentTools) {
-        const filtered = currentTools.filter((tool) => {
-          const name = typeof tool === "string" ? tool : String(tool && tool.name || "");
-          if (policy.allowedTools.size > 0) return policy.allowedTools.has(name);
-          if (policy.deniedTools.has(name)) return false;
-          return !DEFAULT_DENIED_TOOLS.includes(name);
-        });
-        try { probeUpdateLastPromptComposeEntry({ gateway_action: "filter_by_proxy", gateway_returned_tools: filtered.length }); } catch (_) {}
-        return { availableTools: filtered };
-      }
-      const denied = new Set([...policy.deniedTools, ...DEFAULT_DENIED_TOOLS]);
-      try { probeUpdateLastPromptComposeEntry({ gateway_action: "deny_by_proxy", gateway_returned_tools: -1 }); } catch (_) {}
-      return { deniedTools: [...denied] };
-    }
+    return applyAgentGateway(
+      proxySender.slice(FILE_GATEWAY_AGENT_PREFIX.length),
+      payload.availableTools,
+      "proxy"
+    );
   }
   return null;
 }
@@ -167,6 +362,7 @@ const probeLog = [];
 const probeStatus = {
   registered: false,
   registration_error: "",
+  hook_active: false,
   total_events: 0,
   dropped_events: 0,
   events_by_name: {},
@@ -175,6 +371,11 @@ const probeStatus = {
   summary_attributed_events: 0,
   unattributed_events: 0,
   intercept_events: 0,
+  identity_bearing_events: 0,
+  identity_missing_events: 0,
+  host_lifecycle_events: 0,
+  host_identity_bearing_events: 0,
+  runtime_attributed_events: 0,
   last_event_at: 0,
 };
 let probeSequence = 0;
@@ -192,14 +393,65 @@ function probeReadField(payload, keys) {
 
 function probeAttributionFor(sender, chatId) {
   const source = String(sender || "");
+  const id = String(chatId || "");
   if (source.startsWith(PROBE_AGENT_PREFIX)) {
     return { kind: "collaboration_agent", agent_id: source.slice(PROBE_AGENT_PREFIX.length) };
   }
   if (source.startsWith(PROBE_SUMMARY_PREFIX)) {
     return { kind: "collaboration_summary", agent_id: source.slice(PROBE_SUMMARY_PREFIX.length) };
   }
-  if (chatId) return { kind: "chat", agent_id: "" };
+  if (id.startsWith(COLLAB_AGENT_CHAT_PREFIX)) {
+    return { kind: "collaboration_agent", agent_id: id.slice(COLLAB_AGENT_CHAT_PREFIX.length) };
+  }
+  if (id.startsWith(COLLAB_SUMMARY_CHAT_PREFIX)) {
+    return { kind: "collaboration_summary", agent_id: id.slice(COLLAB_SUMMARY_CHAT_PREFIX.length).split(":")[0] };
+  }
+  if (id.startsWith(COLLAB_FINALIZATION_CHAT_PREFIX)) {
+    return { kind: "collaboration_finalization", agent_id: id.slice(COLLAB_FINALIZATION_CHAT_PREFIX.length).split(":")[0] };
+  }
+  if (id) return { kind: "chat", agent_id: "" };
   return { kind: "unattributed", agent_id: "" };
+}
+
+function probeRecordAgentToolInvocation(details) {
+  const data = details || {};
+  const agentId = String(data.agent_id || "").trim();
+  const toolName = String(data.tool_name || "").trim();
+  if (!agentId || !toolName) return null;
+  const timestamp = Date.now();
+  const entry = {
+    seq: (probeSequence += 1),
+    at: timestamp,
+    event_name: "agent_tool_invocation",
+    tool_name: toolName,
+    proxy_sender_name: `${PROBE_AGENT_PREFIX}${agentId}`,
+    proxy_sender_source: "runtime_callback",
+    chat_id: `${COLLAB_AGENT_CHAT_PREFIX}${agentId}`,
+    invocation_id: "",
+    identity_bearing: true,
+    toolpkg_id: "",
+    attribution_kind: "collaboration_agent",
+    attribution_source: "runtime_callback",
+    attributed_agent_id: agentId,
+    execution_epoch: String(data.execution_epoch || ""),
+    is_intercept_phase: false,
+    payload_keys: [],
+    event_keys: [],
+    nested_event_keys: [],
+  };
+  probeLog.push(entry);
+  if (probeLog.length > PROBE_MAX_LOG_ENTRIES) {
+    probeLog.splice(0, probeLog.length - PROBE_MAX_LOG_ENTRIES);
+    probeStatus.dropped_events += 1;
+  }
+  probeStatus.total_events += 1;
+  probeStatus.runtime_attributed_events += 1;
+  probeStatus.agent_attributed_events += 1;
+  probeStatus.identity_bearing_events += 1;
+  probeStatus.events_by_name[entry.event_name] = (probeStatus.events_by_name[entry.event_name] || 0) + 1;
+  probeStatus.events_by_tool[toolName] = (probeStatus.events_by_tool[toolName] || 0) + 1;
+  probeStatus.last_event_at = timestamp;
+  return entry;
 }
 
 function probeRecordEvent(eventName, eventTop, payload) {
@@ -216,10 +468,16 @@ function probeRecordEvent(eventName, eventTop, payload) {
   const chatId = probeReadField(nestedEvent, ["chatId", "chat_id"]) ||
     probeReadField(eventTop, ["chatId", "chat_id"]) ||
     probeReadField(payload, ["chatId", "chat_id"]);
+  const effectiveChatId = chatId || probeReadField(eventTop, ["__operit_package_chat_id"]) ||
+    probeReadField(payload, ["__operit_package_chat_id"]);
+  const invocationId = probeReadField(nestedEvent, ["invocationId", "invocation_id"]) ||
+    probeReadField(eventTop, ["invocationId", "invocation_id"]) ||
+    probeReadField(payload, ["invocationId", "invocation_id"]);
+  const identityBearing = !!(proxySender || effectiveChatId || invocationId);
   const toolPkgId = probeReadField(eventTop, ["toolPkgId", "toolpkg_id", "containerPackageName"]) ||
     probeReadField(nestedEvent, ["toolPkgId", "toolpkg_id", "containerPackageName"]) ||
     probeReadField(payload, ["toolPkgId", "toolpkg_id", "containerPackageName"]);
-  const attribution = probeAttributionFor(proxySender, chatId);
+  const attribution = probeAttributionFor(proxySender, effectiveChatId);
   const isIntercept = String(eventName || "").toLowerCase().includes("intercept") ||
     String(eventPhase || "").toLowerCase().includes("intercept");
 
@@ -237,23 +495,18 @@ function probeRecordEvent(eventName, eventTop, payload) {
     tool_name: toolName,
     proxy_sender_name: proxySender,
     proxy_sender_source: senderSource,
-    chat_id: chatId,
+    chat_id: effectiveChatId,
+    invocation_id: invocationId,
+    identity_bearing: identityBearing,
     toolpkg_id: toolPkgId,
     attribution_kind: attribution.kind,
+    attribution_source: proxySender ? "host_sender" : (effectiveChatId ? "host_chat" : "none"),
     attributed_agent_id: attribution.agent_id,
+    execution_epoch: "",
     is_intercept_phase: isIntercept,
     payload_keys: payload && typeof payload === "object" ? Object.keys(payload).sort() : [],
     event_keys: eventTop && typeof eventTop === "object" ? Object.keys(eventTop).sort() : [],
     nested_event_keys: nestedEvent ? Object.keys(nestedEvent).sort() : [],
-    event_values: eventTop && typeof eventTop === "object"
-      ? Object.keys(eventTop).reduce((acc, k) => {
-          const v = eventTop[k];
-          acc[k] = (typeof v === "string") ? v.slice(0, 200)
-            : (v && typeof v === "object") ? "[" + (Array.isArray(v) ? "array:" + v.length : "object:" + Object.keys(v).length) + "]"
-            : String(v);
-          return acc;
-        }, {})
-      : {},
   };
 
   probeLog.push(entry);
@@ -263,6 +516,8 @@ function probeRecordEvent(eventName, eventTop, payload) {
   }
 
   probeStatus.total_events += 1;
+  probeStatus.host_lifecycle_events += 1;
+  if (identityBearing) probeStatus.host_identity_bearing_events += 1;
   probeStatus.last_event_at = timestamp;
   const en = entry.event_name;
   if (en) probeStatus.events_by_name[en] = (probeStatus.events_by_name[en] || 0) + 1;
@@ -271,6 +526,8 @@ function probeRecordEvent(eventName, eventTop, payload) {
   if (attribution.kind === "collaboration_agent") probeStatus.agent_attributed_events += 1;
   else if (attribution.kind === "collaboration_summary") probeStatus.summary_attributed_events += 1;
   else probeStatus.unattributed_events += 1;
+  if (identityBearing) probeStatus.identity_bearing_events += 1;
+  else probeStatus.identity_missing_events += 1;
   if (isIntercept) probeStatus.intercept_events += 1;
   return entry;
 }
@@ -280,6 +537,7 @@ function onToolLifecycle(event) {
     const payload = event && event.eventPayload ? event.eventPayload : (event || {});
     const eventName = probeReadField(event, ["eventName", "event_name"]) ||
       probeReadField(payload, ["eventName", "event_name", "phase"]);
+    probeStatus.hook_active = true;
     probeRecordEvent(eventName, event || {}, payload);
   } catch (_) {
     // Swallow: observation only, never throw from a host hook.
@@ -288,25 +546,45 @@ function onToolLifecycle(event) {
 }
 
 function probeGetStatus(_params) {
-  return JSON.stringify({
+  const capabilityHookAvailable = typeof ToolPkg !== "undefined" && ToolPkg &&
+    typeof ToolPkg.registerToolLifecycleHook === "function";
+  const registrationState = probeStatus.registered
+    ? "registered"
+    : (probeStatus.hook_active ? "active_without_local_registration" : "not_registered");
+  const attributionCapability = probeStatus.runtime_attributed_events > 0
+    ? "runtime_agent_callbacks_observed"
+    : (probeStatus.host_lifecycle_events === 0
+      ? "no_events_observed"
+      : (probeStatus.host_identity_bearing_events > 0
+        ? "host_identity_fields_observed"
+        : "host_identity_fields_missing"));
+  return {
     success: true,
     probe: "tool_lifecycle",
-    capability_hook_available: typeof ToolPkg !== "undefined" && ToolPkg &&
-      typeof ToolPkg.registerToolLifecycleHook === "function",
+    capability_hook_available: capabilityHookAvailable,
     registered: probeStatus.registered,
+    registration_state: registrationState,
+    hook_active: probeStatus.hook_active,
     registration_error: probeStatus.registration_error || undefined,
     max_entries: PROBE_MAX_LOG_ENTRIES,
     buffered_entries: probeLog.length,
     total_events: probeStatus.total_events,
     dropped_events: probeStatus.dropped_events,
     intercept_events: probeStatus.intercept_events,
+    host_lifecycle_events: probeStatus.host_lifecycle_events,
+    host_identity_bearing_events: probeStatus.host_identity_bearing_events,
+    runtime_attributed_events: probeStatus.runtime_attributed_events,
+    identity_bearing_events: probeStatus.identity_bearing_events,
+    identity_missing_events: probeStatus.identity_missing_events,
+    attribution_capability: attributionCapability,
+    attribution_available: probeStatus.agent_attributed_events > 0 || probeStatus.summary_attributed_events > 0,
     agent_attributed_events: probeStatus.agent_attributed_events,
     summary_attributed_events: probeStatus.summary_attributed_events,
     unattributed_events: probeStatus.unattributed_events,
     events_by_name: { ...probeStatus.events_by_name },
     events_by_tool: { ...probeStatus.events_by_tool },
     last_event_at: probeStatus.last_event_at || undefined,
-  }, null, 2);
+  };
 }
 
 function probeGetLog(params) {
@@ -324,20 +602,28 @@ function probeGetLog(params) {
     return true;
   });
   const page = filtered.slice(-limit);
-  return JSON.stringify({
+  return {
     success: true,
     probe: "tool_lifecycle",
     returned: page.length,
     matched: filtered.length,
     total_events: probeStatus.total_events,
     entries: page.map((entry) => ({ ...entry, payload_keys: [...entry.payload_keys] })),
-  }, null, 2);
+  };
 }
 
 function probeClearLog(_params) {
-  const cleared = probeLog.length;
+  const lifecycleCleared = probeLog.length;
+  const promptComposeCleared = promptComposeLog.length;
   probeLog.length = 0;
-  return JSON.stringify({ success: true, probe: "tool_lifecycle", cleared });
+  promptComposeLog.length = 0;
+  return {
+    success: true,
+    probe: "tool_lifecycle",
+    cleared: lifecycleCleared + promptComposeCleared,
+    lifecycle_cleared: lifecycleCleared,
+    prompt_compose_cleared: promptComposeCleared,
+  };
 }
 
 // Record prompt-compose events to verify proxySenderName availability.
@@ -390,15 +676,71 @@ function probeUpdateLastPromptComposeEntry(updates) {
 }
 
 function probeGetPromptComposeLog(_params) {
-  return JSON.stringify({
+  return {
     success: true,
     probe: "prompt_compose",
     buffered_entries: promptComposeLog.length,
     entries: promptComposeLog.slice(-50),
-  }, null, 2);
+  };
+}
+function resolveDashboardScreen(moduleRef) {
+  // During ToolPkg registration, requiring a local *.ui.js returns a path-tagged
+  // placeholder function. In normal CommonJS execution it returns the exports object.
+  if (typeof moduleRef === "function") return moduleRef;
+  if (!moduleRef || typeof moduleRef !== "object") return null;
+  if (typeof moduleRef.default === "function") return moduleRef.default;
+  if (typeof moduleRef.Screen === "function") return moduleRef.Screen;
+  return null;
+}
+
+function registerDashboardUi() {
+  if (dashboardUiRegistered) return true;
+  if (typeof ToolPkg === "undefined" || !ToolPkg ||
+      typeof ToolPkg.registerToolboxUiModule !== "function") {
+    dashboardUiRegistrationError = "registerToolboxUiModule is unavailable";
+    return false;
+  }
+  try {
+    const dashboardScreen = resolveDashboardScreen(
+      require("./ui/collaboration_dashboard/index.ui.js")
+    );
+    if (typeof dashboardScreen !== "function") {
+      throw new Error("collaboration dashboard entry function is unavailable");
+    }
+
+    ToolPkg.registerToolboxUiModule({
+      id: "collaboration_dashboard_v101",
+      runtime: "compose_dsl",
+      screen: dashboardScreen,
+      params: {},
+      keepAlive: true,
+      title: {
+        zh: "多 Agent 控制台",
+        en: "Collaboration Dashboard",
+      },
+    });
+    dashboardUiRegistered = true;
+    dashboardUiRegistrationError = "";
+    return true;
+  } catch (error) {
+    dashboardUiRegistrationError = error instanceof Error ? error.message : String(error);
+    return false;
+  }
+}
+
+function dashboardUiStatus() {
+  return {
+    registered: dashboardUiRegistered,
+    registration_error: dashboardUiRegistrationError || undefined,
+  };
 }
 
 function registerToolPkg() {
+  registerDashboardUi();
+  ToolPkg.registerPromptHistoryHook({
+    id: "collaboration_conversation_history_snapshot",
+    function: onPromptHistory,
+  });
   ToolPkg.registerToolPromptComposeHook({
     id: "collaboration_prompt_compose_gateway",
     function: onToolPromptCompose,
@@ -428,12 +770,19 @@ function registerToolPkg() {
 
 module.exports = {
   registerToolPkg,
+  registerDashboardUi,
+  resolveDashboardScreen,
+  dashboardUiStatus,
+  onPromptHistory,
   onToolPromptCompose,
+  snapshotConversationHistory,
+  getConversationHistory,
   onToolLifecycle,
   probeGetStatus,
   probeGetLog,
   probeClearLog,
   probeGetPromptComposeLog,
+  probeRecordAgentToolInvocation,
   registerFileGateway,
   unregisterFileGateway,
   fileGatewayStatus,

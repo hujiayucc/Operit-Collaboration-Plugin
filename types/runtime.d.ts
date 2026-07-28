@@ -28,10 +28,22 @@ declare namespace ToolPkg {
     function: (event: AppLifecycleHookEvent) => unknown;
   }
 
+  interface ToolboxUiModuleRegistration {
+    id: string;
+    runtime: "compose_dsl";
+    screen: (ctx: any) => unknown;
+    params?: Record<string, unknown>;
+    keepAlive?: boolean;
+    title?: string | { zh?: string; en?: string };
+  }
+
   interface Registry {
     ipc: IpcApi;
+    registerPromptHistoryHook(definition: { id: string; function: (event: any) => unknown }): void;
     registerToolPromptComposeHook(definition: { id: string; function: (event: any) => unknown }): void;
     registerAppLifecycleHook(definition: AppLifecycleHookRegistration): void;
+    registerToolLifecycleHook?(definition: { id: string; function: (event: any) => unknown }): void;
+    registerToolboxUiModule?(definition: ToolboxUiModuleRegistration): void;
   }
 }
 

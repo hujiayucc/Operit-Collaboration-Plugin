@@ -2,9 +2,11 @@
 
 const { clipText, createId, isPathWithin, normalizePath, now, safePublicResult } = require("./helpers.js");
 
+const MIN_TIMEOUT_MS = 30000;
+const MAX_TIMEOUT_MS = 3600000;
 const DEFAULT_TIMEOUT_MS = 900000;
 const DEFAULT_MAX_TOOL_CALLS = 16;
-const MAX_RESULT_CHARS = 12000;
+const MAX_RESULT_CHARS = 24000;
 const MAX_EVENTS = 300;
 const MAX_EXECUTIONS = 30;
 const MAX_HISTORY = 12;
@@ -22,10 +24,13 @@ function isTerminal(status) {
 }
 
 function normalizeTimeout(value, fallback = DEFAULT_TIMEOUT_MS) {
-  const requested = Number(value ?? fallback);
-  return Number.isFinite(requested)
-    ? Math.max(30000, Math.min(3600000, Math.floor(requested)))
-    : fallback;
+  if (value === undefined || value === null || value === "") return fallback;
+  const requested = Number(value);
+  if (!Number.isFinite(requested) || !Number.isInteger(requested) ||
+      requested < MIN_TIMEOUT_MS || requested > MAX_TIMEOUT_MS) {
+    throw new Error(`timeout_ms must be an integer between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}`);
+  }
+  return requested;
 }
 
 function normalizeMaxToolCalls(value, fallback = DEFAULT_MAX_TOOL_CALLS) {
@@ -33,6 +38,14 @@ function normalizeMaxToolCalls(value, fallback = DEFAULT_MAX_TOOL_CALLS) {
   return Number.isFinite(requested)
     ? Math.max(1, Math.min(50, Math.floor(requested)))
     : fallback;
+}
+
+function normalizeWorkspaceEnv(value, fallback = "android") {
+  const workspaceEnv = String(value || fallback).trim().toLowerCase();
+  if (workspaceEnv !== "android" && workspaceEnv !== "linux") {
+    throw new Error("workspace_env must be android or linux");
+  }
+  return workspaceEnv;
 }
 
 function normalizeTargetPaths(value) {
@@ -64,7 +77,7 @@ function createAgent(payload) {
     readOnly: requestedReadOnly || targetPaths.length === 0,
     targetPaths,
     workspacePath,
-    workspaceEnv: String(payload.workspace_env || "").trim() || "android",
+    workspaceEnv: normalizeWorkspaceEnv(payload.workspace_env),
     timeoutMs: normalizeTimeout(payload.timeout_ms),
     maxToolCalls: normalizeMaxToolCalls(payload.max_tool_calls),
     priority: normalizePriority(payload.priority),
@@ -86,7 +99,7 @@ function normalizePriority(value) {
   return priority === "high" || priority === "low" ? priority : "normal";
 }
 
-function createExecution(agent, task, context, relation = {}) {
+function createExecution(agent, task, context, relation = {}, conversationContext = []) {
   agent.runSeq += 1;
   const executionId = createId("execution");
   const parentRunId = String(relation.parentRunId || "").trim();
@@ -109,6 +122,9 @@ function createExecution(agent, task, context, relation = {}) {
     treeDepth: Math.max(0, Math.floor(Number(relation.treeDepth) || 0)),
     task,
     context,
+    conversationContext: Array.isArray(conversationContext)
+      ? conversationContext.map((turn) => ({ kind: String(turn.kind || ""), content: String(turn.content || "") }))
+      : [],
     status: "queued",
     physicalStatus: "queued",
     cancelRequested: false,
@@ -116,6 +132,13 @@ function createExecution(agent, task, context, relation = {}) {
     stepCount: 0,
     toolCount: 0,
     currentTool: "",
+    modelRequestAttempts: 0,
+    modelRetryCount: 0,
+    currentModelRequestAttempt: 0,
+    lastModelRetryError: "",
+    lastModelRetryDelayMs: 0,
+    modelRetryToolOutcomeUnknown: false,
+    retryVerificationPending: false,
     checkpoints: [],
     result: "",
     lateResult: "",
@@ -124,6 +147,13 @@ function createExecution(agent, task, context, relation = {}) {
     summaryStatus: "not_required",
     summaryFallbackUsed: false,
     resultSuppressed: false,
+    continuationRequired: false,
+    continuationRepairCount: 0,
+    currentActionGate: null,
+    actionGateActivationCount: 0,
+    actionGateBlockCount: 0,
+    continuationRepairStreak: 0,
+    lastStepDiagnostics: null,
     messageDeliveryWarning: "",
     controlMode: "compatibility",
     controlStatus: "not_received",
@@ -157,7 +187,7 @@ function emitEvent(agent, execution, type, data = {}) {
     execution_id: execution ? execution.id : "",
     run_seq: execution ? execution.seq : agent.runSeq,
     created_at: now(),
-    data,
+    data: Object.assign({}, data),
   };
   agent.events.push(event);
   if (agent.events.length > MAX_EVENTS) agent.events.splice(0, agent.events.length - MAX_EVENTS);
@@ -200,9 +230,24 @@ function publicExecution(execution, includeResult) {
       : undefined,
     status: execution.status,
     physical_status: execution.physicalStatus,
+    task_excerpt: clipText(String(execution.task || ""), 240),
+    conversation_context_included: Array.isArray(execution.conversationContext) && execution.conversationContext.length > 0 || undefined,
+    conversation_context_turns: Array.isArray(execution.conversationContext) && execution.conversationContext.length > 0
+      ? execution.conversationContext.length
+      : undefined,
     checkpoint_turns: execution.stepCount,
     tool_count: execution.toolCount,
+    model_request_attempts: Number(execution.modelRequestAttempts) || 0,
+    model_retry_count: Number(execution.modelRetryCount) || 0,
+    current_model_request_attempt: Number(execution.currentModelRequestAttempt) || undefined,
+    last_model_retry_error: execution.lastModelRetryError || undefined,
+    last_model_retry_delay_ms: Number(execution.lastModelRetryDelayMs) || undefined,
+    model_retry_tool_outcome_unknown: execution.modelRetryToolOutcomeUnknown || undefined,
+    retry_verification_pending: execution.retryVerificationPending || undefined,
     current_tool: execution.currentTool || undefined,
+    current_action_gate: execution.currentActionGate || null,
+    action_gate_activation_count: Number(execution.actionGateActivationCount) || 0,
+    action_gate_block_count: Number(execution.actionGateBlockCount) || 0,
     created_at: execution.createdAt,
     started_at: execution.startedAt || undefined,
     completed_at: execution.completedAt || undefined,
@@ -211,6 +256,10 @@ function publicExecution(execution, includeResult) {
     summary_status: execution.summaryStatus || "not_required",
     summary_fallback_used: execution.summaryFallbackUsed || undefined,
     result_suppressed: execution.resultSuppressed || undefined,
+    continuation_required: execution.continuationRequired || undefined,
+    continuation_repair_count: Number(execution.continuationRepairCount) || undefined,
+    continuation_repair_streak: Number(execution.continuationRepairStreak) || undefined,
+    diagnostics: execution.lastStepDiagnostics || undefined,
     message_delivery_warning: execution.messageDeliveryWarning || undefined,
     control_mode: execution.controlMode || "compatibility",
     control_status: execution.controlStatus || "not_received",
@@ -238,6 +287,9 @@ function publicAgent(agent, execution, includeResult = false, includeEvents = fa
     target_paths: agent.targetPaths,
     workspace_path: agent.workspacePath || undefined,
     workspace_env: agent.workspaceEnv,
+    priority: agent.priority,
+    timeout_ms: agent.timeoutMs,
+    max_tool_calls: agent.maxToolCalls,
     pending_messages: agent.inbox.filter((message) => message.status === "queued").length,
     inflight_messages: agent.inbox.filter((message) => message.status === "inflight").length || undefined,
     delivered_messages: deliveredMessages,
@@ -264,5 +316,6 @@ module.exports = {
   normalizePriority,
   normalizeTargetPaths,
   normalizeTimeout,
+  normalizeWorkspaceEnv,
   publicAgent,
 };

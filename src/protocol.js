@@ -7,6 +7,12 @@ const CHANNELS = Object.freeze({
   FOLLOWUP_TASK: "collaboration.followup_task",
   WAIT_AGENT: "collaboration.wait_agent",
   INTERRUPT_AGENT: "collaboration.interrupt_agent",
+  INSPECT_AGENT: "collaboration.inspect_agent",
+  LIST_TREE: "collaboration.list_tree",
+  GET_SETTINGS: "collaboration.get_settings",
+  UPDATE_SETTINGS: "collaboration.update_settings",
+  DELETE_AGENT: "collaboration.delete_agent",
+  CLEAR_HISTORY: "collaboration.clear_history",
   PROBE_GET_STATUS: "probe.get_status",
   PROBE_GET_LOG: "probe.get_log",
   PROBE_CLEAR_LOG: "probe.clear_log",
@@ -44,6 +50,41 @@ function parseOptionalStringArray(value, fieldName) {
   return parsed.map((item) => item.trim()).filter(Boolean);
 }
 
+function classifyErrorCode(message) {
+  const text = String(message || "");
+  if (/valid JSON|JSON string array|string array/i.test(text)) return "invalid_json";
+  if (/request_id conflict/i.test(text)) return "request_id_conflict";
+  if (/write path conflict/i.test(text)) return "path_conflict";
+  if (/outside workspace/i.test(text)) return "path_outside_workspace";
+  if (/workspace_env/i.test(text)) return "workspace_env_invalid";
+  if (/timeout_ms/i.test(text)) return "timeout_invalid";
+  if (/max_model_retries/i.test(text)) return "max_model_retries_invalid";
+  if (/non-empty array|agent_ids/i.test(text)) return "agent_ids_invalid";
+  if (/limit/i.test(text)) return "limit_invalid";
+  if (/cursor/i.test(text)) return "cursor_invalid";
+  if (/agent not found/i.test(text)) return "agent_not_found";
+  if (/is (?:queued|running|summarizing|cancelling|completed|failed|interrupted|timed_out|orphaned)/i.test(text)) return "agent_state_invalid";
+  if (/required/i.test(text)) return "parameter_required";
+  return "operation_failed";
+}
+
+function toolFailure(error, operation, details = {}) {
+  const message = error instanceof Error ? error.message : String(error);
+  const failure = {
+    success: false,
+    error: {
+      code: classifyErrorCode(message),
+      message,
+      details: { operation: String(operation || "tool_call"), ...details },
+    },
+  };
+  return {
+    transport_success: true,
+    operation_success: false,
+    result: failure,
+  };
+}
+
 function formatJson(value) {
   return JSON.stringify(value, null, 2);
 }
@@ -52,7 +93,9 @@ module.exports = {
   CHANNELS,
   IPC_OPTIONS,
   asText,
+  classifyErrorCode,
   parseJson,
   parseOptionalStringArray,
+  toolFailure,
   formatJson,
 };
