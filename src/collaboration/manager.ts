@@ -1,20 +1,28 @@
-"use strict";
-
-const { actionGateForAgent, actionGateToolAllowed, cancelService, clearModelRetryVerification, executeModelStep } = require("./engine.js");
-const { createCollaborationStore, STATE_SCHEMA_VERSION } = require("./store.js");
-const { clipText, createId, errorText, isPathWithin, normalizePath, now, pathsOverlap } = require("./helpers.js");
-const {
+import { actionGateForAgent, actionGateToolAllowed, cancelService, clearModelRetryVerification, executeModelStep } from "./engine.js";
+import { createCollaborationStore, STATE_SCHEMA_VERSION, type CollaborationStore } from "./store.js";
+import { cleanAgentResult, clipText, createId, errorText, isPathWithin, normalizePath, now, pathsOverlap, safePublicResult, type JsonRecord, type OutboundControlMessage } from "./helpers.js";
+import type {
+  AgentContextCursor,
+  CollaborationActionGateState,
+  CollaborationAgent,
+  CollaborationCheckpoint,
+  CollaborationExecution,
+  CollaborationMessage,
+  CollaborationStreamState,
+  TreeContextEvent,
+} from "./model.js";
+import {
   appendHistory,
   createAgent,
   createExecution,
-  emitEvent,
+  emitEvent as emitAgentEvent,
   isTerminal,
   normalizePriority,
   normalizeTargetPaths,
   normalizeTimeout,
   normalizeWorkspaceEnv,
   publicAgent,
-} = require("./model.js");
+} from "./model.js";
 
 const DEFAULT_GLOBAL_CONCURRENCY = 6;
 const MIN_GLOBAL_CONCURRENCY = 1;
@@ -32,6 +40,14 @@ const DEFAULT_CONVERSATION_CONTEXT_MODE = "auto";
 const CONVERSATION_CONTEXT_MODES = new Set(["off", "on", "auto"]);
 const MAX_CONVERSATION_CONTEXT_TURNS = 40;
 const MAX_CONVERSATION_CONTEXT_CHARS = 32000;
+const MAX_TREE_CONTEXT_EVENTS = 80;
+const MAX_TREE_CONTEXT_CHARS = 24000;
+const MAX_TREE_CONTEXT_EVENT_CHARS = 4000;
+const MAX_STREAM_PUBLIC_CHARS = 24000;
+const MAX_STREAM_DELTA_EVENT_CHARS = 1024;
+const STREAM_DELTA_FLUSH_CHARS = 512;
+const STREAM_DELTA_FLUSH_MS = 100;
+const STREAM_SNAPSHOT_PERSIST_MS = 1000;
 const SETTINGS_META_KEY = "collaboration_settings_v1";
 const MAX_TREE_DEPTH = 8;
 const MAX_DIRECT_CHILDREN = 12;
@@ -45,11 +61,120 @@ const MAX_FINALIZATION_REPAIRS = 3;
 const MAX_SCOPED_MUTATION_FAILURES = 3;
 const DEFAULT_LIST_LIMIT = 20;
 const MAX_LIST_LIMIT = 100;
+const DEFAULT_TREE_EVENT_LIMIT = 100;
+const MAX_TREE_EVENT_LIMIT = 100;
+const MAX_TREE_EVENT_HISTORY = 500;
+const DEFAULT_TREE_EVENT_WAIT_MS = 12000;
+const MAX_TREE_EVENT_WAIT_MS = 12000;
 const QUEUE_AGING_STEP_MS = 120000;
 const ACTIVE_RECOVERY_STATUSES = new Set(["running", "cancelling", "summarizing"]);
 const PRIORITY_RANK = Object.freeze({ high: 0, normal: 1, low: 2 });
 
-function requestFingerprint(payload) {
+type QueueEntry = {
+  agentId: string;
+  executionId: string;
+  priority: string;
+  rootAgentId: string;
+  rootRunId: string;
+  enqueuedAt: number;
+};
+type WaitResult = JsonRecord;
+type Waiter = {
+  ids: string[];
+  resolve: (value: WaitResult) => void;
+  timeoutId: unknown;
+};
+type RetryWaiter = {
+  timeoutId: unknown;
+  resolve: (value: boolean) => void;
+};
+type TreeEvent = JsonRecord & {
+  revision: number;
+  root_run_id: string;
+  agent_id: string;
+  execution_id: string;
+  run_seq: number;
+  type: unknown;
+  created_at: number;
+  data: JsonRecord;
+};
+type TreeEventWaiter = {
+  rootRunId: string;
+  afterRevision: number;
+  limit: number;
+  resolve: (value: ManagerEnvelope) => void;
+  timeoutId: unknown;
+};
+type StreamAccumulator = {
+  executionId: string;
+  epoch: string;
+  requestAttempt: number;
+  streamSeq: number;
+  pendingDelta: string;
+  lastFlushAt: number;
+  lastPersistAt: number;
+  flushTimer: unknown;
+};
+type PendingToolInvocation = {
+  invocationId: string;
+  hostInvocationId: string;
+  agentId: string;
+  executionId: string;
+  executionEpoch: string;
+  toolName: string;
+  createdAt: number;
+};
+type RoutedMessage = JsonRecord;
+type EffectRecord = JsonRecord & {
+  effectKey: string;
+  status: string;
+  operation: string;
+};
+type RecoveryRecord = JsonRecord & {
+  attemptId: string;
+  runId: string;
+  agentId: string;
+  runSeq: number;
+  attempt: number;
+  executionEpoch: string;
+  status: string;
+  recoveryReason: string;
+  contextReplayed: boolean;
+  createdAt: number;
+  startedAt: number;
+  completedAt: number;
+};
+type ManagerOptions = {
+  retryDelayScale?: unknown;
+  store?: CollaborationStore;
+  getConversationContext?: (chatId: string) => unknown;
+  onAgentToolInvocation?: (event: JsonRecord) => void;
+};
+type RuntimeActionGate = ReturnType<typeof actionGateForAgent>;
+type ModelStepResponse = Awaited<ReturnType<typeof executeModelStep>>;
+type ModelStepCallbacks = Parameters<typeof executeModelStep>[3];
+type ListCursor = { createdAt: number; agentId: string } | null;
+type ManagerEnvelope = JsonRecord;
+type RouteOutboundResult = {
+  changedAgents: CollaborationAgent[];
+  results: RoutedMessage[];
+};
+type ModelErrorClassification = {
+  text: string;
+  status: number;
+  retryable: boolean;
+  retryAfterMs: number;
+};
+type PriorAgentStates = Map<string, CollaborationAgent>;
+type ServiceKeySet = Set<string>;
+
+function asRecord(value: unknown): JsonRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonRecord
+    : {};
+}
+
+function requestFingerprint(payload: JsonRecord): string {
   return JSON.stringify({
     task: String(payload.task || "").trim(),
     context: String(payload.context || "").trim(),
@@ -67,7 +192,7 @@ function requestFingerprint(payload) {
   });
 }
 
-function operationFingerprint(operation, payload) {
+function operationFingerprint(operation: string, payload: JsonRecord): string {
   if (operation === "spawn_agent") return requestFingerprint(payload);
   if (operation === "send_message") {
     return JSON.stringify({
@@ -99,23 +224,29 @@ function operationFingerprint(operation, payload) {
   throw new Error(`unsupported idempotent operation: ${operation}`);
 }
 
-function createCollaborationManager(options = {}) {
-  const agents = new Map();
-  const executions = new Map();
-  const queue = [];
-  const waiters = [];
-  const modelRetryWaiters = new Map();
-  const activeByRoot = new Map();
+export function createCollaborationManager(options: ManagerOptions = {}) {
+  const agents = new Map<string, CollaborationAgent>();
+  const executions = new Map<string, CollaborationExecution>();
+  const queue: QueueEntry[] = [];
+  const waiters: Waiter[] = [];
+  const modelRetryWaiters = new Map<string, RetryWaiter>();
+  const streamAccumulators = new Map<string, StreamAccumulator>();
+  const pendingToolInvocations = new Map<string, PendingToolInvocation>();
+  const treeContextWatchers = new Map<string, Set<string>>();
+  const treeEventHistory = new Map<string, TreeEvent[]>();
+  const treeEventRevisions = new Map<string, number>();
+  const treeEventWaiters: TreeEventWaiter[] = [];
+  const activeByRoot = new Map<string, number>();
   const retryDelayScale = Number.isFinite(Number(options.retryDelayScale))
     ? Math.max(0, Number(options.retryDelayScale))
     : 1;
   const store = options.store && typeof options.store.load === "function"
     ? options.store
     : createCollaborationStore();
-  const getConversationContext = typeof options.getConversationContext === "function"
+  const getConversationContext: (chatId: string) => unknown = typeof options.getConversationContext === "function"
     ? options.getConversationContext
     : () => [];
-  const onAgentToolInvocation = typeof options.onAgentToolInvocation === "function"
+  const onAgentToolInvocation: (event: JsonRecord) => void = typeof options.onAgentToolInvocation === "function"
     ? options.onAgentToolInvocation
     : () => {};
   let active = 0;
@@ -132,46 +263,129 @@ function createCollaborationManager(options = {}) {
     : "";
   let shuttingDown = false;
 
-  function latestExecution(agent) {
+  function latestExecution(agent: CollaborationAgent): CollaborationExecution | null {
     return agent.currentExecutionId ? executions.get(agent.currentExecutionId) || null : null;
   }
 
-  function normalizeGlobalConcurrency(value, fallback = DEFAULT_GLOBAL_CONCURRENCY) {
+  function rootRunIdForExecution(execution: CollaborationExecution | null | undefined): string {
+    return execution
+      ? String(execution.rootRunId || ((Number(execution.treeDepth) || 0) === 0 ? execution.id : "")).trim()
+      : "";
+  }
+
+  function treeEventRevisionFor(rootRunId: string): number {
+    return Number(treeEventRevisions.get(rootRunId)) || 0;
+  }
+
+  function treeEventBatch(rootRunId: string, afterRevision: number, limit: number): JsonRecord {
+    const currentRevision = treeEventRevisionFor(rootRunId);
+    const history = treeEventHistory.get(rootRunId) || [];
+    const oldestRevision = history.length > 0 ? Number(history[0].revision) || currentRevision : currentRevision;
+    const snapshotRequired = afterRevision > currentRevision ||
+      (afterRevision > 0 && history.length > 0 && afterRevision < oldestRevision - 1);
+    if (snapshotRequired) {
+      return {
+        root_run_id: rootRunId,
+        events: [],
+        revision: currentRevision,
+        next_revision: currentRevision,
+        snapshot_required: true,
+        has_more: false,
+      };
+    }
+    const available = history.filter((event) => event.revision > afterRevision);
+    const events = available.slice(0, limit);
+    const nextRevision = events.length > 0
+      ? Number(events[events.length - 1].revision) || afterRevision
+      : afterRevision;
+    return {
+      root_run_id: rootRunId,
+      events,
+      revision: currentRevision,
+      next_revision: nextRevision,
+      snapshot_required: false,
+      has_more: available.length > events.length,
+    };
+  }
+
+  function resolveTreeEventWaiters(rootRunId: string): void {
+    for (let index = treeEventWaiters.length - 1; index >= 0; index -= 1) {
+      const waiter = treeEventWaiters[index];
+      if (waiter.rootRunId !== rootRunId || treeEventRevisionFor(rootRunId) <= waiter.afterRevision) continue;
+      treeEventWaiters.splice(index, 1);
+      clearTimeout(waiter.timeoutId);
+      waiter.resolve(envelope({ ...treeEventBatch(rootRunId, waiter.afterRevision, waiter.limit), timed_out: false }));
+    }
+  }
+
+  function emitEvent(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution | null | undefined,
+    type: unknown,
+    data: JsonRecord = {},
+  ): JsonRecord {
+    const event = emitAgentEvent(agent, execution, type, data);
+    const rootRunId = rootRunIdForExecution(execution || latestExecution(agent));
+    if (!rootRunId) return event;
+    const revision = treeEventRevisionFor(rootRunId) + 1;
+    treeEventRevisions.set(rootRunId, revision);
+    const treeEvent: TreeEvent = {
+      revision,
+      root_run_id: rootRunId,
+      agent_id: agent.id,
+      execution_id: execution ? execution.id : String(event.execution_id || ""),
+      run_seq: Number(event.run_seq) || agent.runSeq,
+      type: event.type,
+      created_at: Number(event.created_at) || now(),
+      data: asRecord(event.data),
+    };
+    const history = treeEventHistory.get(rootRunId) || [];
+    history.push(treeEvent);
+    if (history.length > MAX_TREE_EVENT_HISTORY) history.splice(0, history.length - MAX_TREE_EVENT_HISTORY);
+    treeEventHistory.set(rootRunId, history);
+    resolveTreeEventWaiters(rootRunId);
+    return event;
+  }
+
+  function normalizeGlobalConcurrency(value: unknown, fallback: number = DEFAULT_GLOBAL_CONCURRENCY): number {
     const requested = Number(value);
-    return Number.isInteger(requested) && requested >= MIN_GLOBAL_CONCURRENCY && requested <= MAX_GLOBAL_CONCURRENCY
+    return Number.isInteger(requested) && (requested === 0 ||
+      (requested >= MIN_GLOBAL_CONCURRENCY && requested <= MAX_GLOBAL_CONCURRENCY))
       ? requested
       : fallback;
   }
 
-  function normalizeActiveRunsPerRoot(value, fallback = DEFAULT_ACTIVE_RUNS_PER_ROOT) {
+  function normalizeActiveRunsPerRoot(value: unknown, fallback: number = DEFAULT_ACTIVE_RUNS_PER_ROOT): number {
     const requested = Number(value);
-    return Number.isInteger(requested) && requested >= MIN_ACTIVE_RUNS_PER_ROOT && requested <= MAX_ACTIVE_RUNS_PER_ROOT
+    return Number.isInteger(requested) && (requested === 0 ||
+      (requested >= MIN_ACTIVE_RUNS_PER_ROOT && requested <= MAX_ACTIVE_RUNS_PER_ROOT))
       ? requested
       : fallback;
   }
 
-  function normalizeGlobalMaxToolCalls(value, fallback = DEFAULT_GLOBAL_MAX_TOOL_CALLS) {
+  function normalizeGlobalMaxToolCalls(value: unknown, fallback: number = DEFAULT_GLOBAL_MAX_TOOL_CALLS): number {
     const requested = Number(value);
-    return Number.isInteger(requested) && requested >= MIN_GLOBAL_MAX_TOOL_CALLS && requested <= MAX_GLOBAL_MAX_TOOL_CALLS
+    return Number.isInteger(requested) && (requested === 0 ||
+      (requested >= MIN_GLOBAL_MAX_TOOL_CALLS && requested <= MAX_GLOBAL_MAX_TOOL_CALLS))
       ? requested
       : fallback;
   }
 
-  function normalizeModelRetries(value, fallback = DEFAULT_MODEL_RETRIES) {
+  function normalizeModelRetries(value: unknown, fallback: number = DEFAULT_MODEL_RETRIES): number {
     const requested = Number(value);
-    return Number.isInteger(requested) && requested >= MIN_MODEL_RETRIES && requested <= MAX_MODEL_RETRIES
+    return Number.isInteger(requested) && requested >= -1 && requested <= MAX_MODEL_RETRIES
       ? requested
       : fallback;
   }
 
-  function normalizeConversationContextMode(value, fallback = DEFAULT_CONVERSATION_CONTEXT_MODE) {
+  function normalizeConversationContextMode(value: unknown, fallback: string = DEFAULT_CONVERSATION_CONTEXT_MODE): string {
     const requested = String(value || "").trim().toLowerCase();
     return CONVERSATION_CONTEXT_MODES.has(requested) ? requested : fallback;
   }
 
-  function normalizeConversationContext(value) {
+  function normalizeConversationContext(value: unknown): Array<{ kind: string; content: string }> {
     const source = Array.isArray(value) ? value.slice(-MAX_CONVERSATION_CONTEXT_TURNS) : [];
-    const reversed = [];
+    const reversed: Array<{ kind: string; content: string }> = [];
     let remaining = MAX_CONVERSATION_CONTEXT_CHARS;
     for (let index = source.length - 1; index >= 0 && remaining > 0; index -= 1) {
       const turn = source[index] || {};
@@ -185,31 +399,464 @@ function createCollaborationManager(options = {}) {
     return reversed.reverse();
   }
 
-  function conversationContextFor(payload) {
-    const requested = payload && payload.include_conversation_context === true;
-    const include = settings.conversationContextMode === "on" ||
-      (settings.conversationContextMode === "auto" && requested);
-    if (!include) return [];
-    const chatIds = [];
-    const directChatId = String(payload && payload.parent_chat_id || "").trim();
-    if (directChatId) chatIds.push(directChatId);
-    let parentId = String(payload && payload.parent_agent_id || "").trim();
-    for (let depth = 0; parentId && depth < MAX_TREE_DEPTH; depth += 1) {
-      const parent = agents.get(parentId);
-      if (!parent) break;
-      const inheritedChatId = String(parent.parentChatId || "").trim();
-      if (inheritedChatId && !chatIds.includes(inheritedChatId)) chatIds.push(inheritedChatId);
-      parentId = String(parent.parentAgentId || "").trim();
-    }
-    for (const chatId of chatIds) {
-      try {
-        const snapshot = normalizeConversationContext(getConversationContext(chatId));
-        if (snapshot.length > 0) return snapshot;
-      } catch (error) {
-        persistenceError = persistenceError || `conversation context unavailable: ${errorText(error)}`;
+  function sharedContextRequested(payload: JsonRecord): boolean {
+    return settings.conversationContextMode === "on" ||
+      (settings.conversationContextMode === "auto" && payload && payload.include_conversation_context === true);
+  }
+
+  function visibleTreeContextEvent(
+    event: TreeContextEvent,
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+  ): boolean {
+    if (event.visibility === "tree") return true;
+    if (event.visibility === "agent") return event.sourceAgentId === agent.id;
+    if (event.visibility === "parent") return execution.id === event.sourceRunId || execution.parentRunId === event.sourceRunId;
+    if (event.visibility === "children") {
+      let current: CollaborationExecution | null = execution;
+      const seen = new Set<string>();
+      while (current?.parentRunId && !seen.has(current.parentRunId)) {
+        if (current.parentRunId === event.sourceRunId) return true;
+        seen.add(current.parentRunId);
+        current = executions.get(current.parentRunId) || null;
       }
     }
-    return [];
+    return false;
+  }
+
+  function treeContextPayload(event: TreeContextEvent): string {
+    const payload = asRecord(event.payload);
+    if (event.kind === "checkpoint") {
+      const result = clipText(payload.result, MAX_TREE_CONTEXT_EVENT_CHARS);
+      const tools = Array.isArray(payload.tool_names)
+        ? payload.tool_names.map((toolName) => String(toolName || "").trim()).filter(Boolean)
+        : [];
+      const control = String(payload.control_action || "").trim();
+      return [
+        `checkpoint step=${Number(payload.step) || 0}${control ? ` control=${control}` : ""}`,
+        tools.length > 0 ? `tools=${tools.join(",")}` : "",
+        result,
+      ].filter(Boolean).join("\n");
+    }
+    if (typeof event.payload === "string") return clipText(event.payload, MAX_TREE_CONTEXT_EVENT_CHARS);
+    return clipText(JSON.stringify(event.payload), MAX_TREE_CONTEXT_EVENT_CHARS);
+  }
+
+  function normalizeStreamState(execution: CollaborationExecution): void {
+    const state = execution.streamState && typeof execution.streamState === "object"
+      ? asRecord(execution.streamState)
+      : {};
+    const status = String(state.status || "idle");
+    execution.streamState = {
+      requestAttempt: Math.max(0, Math.floor(Number(state.requestAttempt) || 0)),
+      streamSeq: Math.max(0, Math.floor(Number(state.streamSeq) || 0)),
+      offset: Math.max(0, Math.floor(Number(state.offset) || 0)),
+      status: status === "streaming" || status === "completed" || status === "interrupted" ? status : "idle",
+      publicText: String(state.publicText || "").slice(-MAX_STREAM_PUBLIC_CHARS),
+      promptEchoSuppressed: state.promptEchoSuppressed === true,
+      startedAt: Math.max(0, Math.floor(Number(state.startedAt) || 0)),
+      updatedAt: Math.max(0, Math.floor(Number(state.updatedAt) || 0)),
+      completedAt: Math.max(0, Math.floor(Number(state.completedAt) || 0)),
+    } as CollaborationStreamState;
+  }
+
+  function normalizeTreeContextState(execution: CollaborationExecution): void {
+    const state = execution.treeContextState && typeof execution.treeContextState === "object"
+      ? asRecord(execution.treeContextState)
+      : {};
+    execution.treeContextState = {
+      watcherActive: state.watcherActive === true,
+      appliedRevision: Math.max(0, Math.floor(Number(state.appliedRevision) || 0)),
+      pendingRevision: Math.max(0, Math.floor(Number(state.pendingRevision) || 0)),
+      lastBroadcastRevision: Math.max(0, Math.floor(Number(state.lastBroadcastRevision) || 0)),
+      broadcastCount: Math.max(0, Math.floor(Number(state.broadcastCount) || 0)),
+      refreshCount: Math.max(0, Math.floor(Number(state.refreshCount) || 0)),
+      refreshRevision: Math.max(0, Math.floor(Number(state.refreshRevision) || 0)),
+    };
+  }
+
+  function registerTreeContextWatcher(execution: CollaborationExecution): void {
+    normalizeTreeContextState(execution);
+    const rootRunId = String(execution.rootRunId || execution.id || "").trim();
+    if (!rootRunId) return;
+    let watchers = treeContextWatchers.get(rootRunId);
+    if (!watchers) {
+      watchers = new Set<string>();
+      treeContextWatchers.set(rootRunId, watchers);
+    }
+    watchers.add(execution.id);
+    execution.treeContextState.watcherActive = true;
+  }
+
+  function unregisterTreeContextWatcher(execution: CollaborationExecution): void {
+    normalizeTreeContextState(execution);
+    const rootRunId = String(execution.rootRunId || execution.id || "").trim();
+    const watchers = treeContextWatchers.get(rootRunId);
+    if (watchers) {
+      watchers.delete(execution.id);
+      if (watchers.size === 0) treeContextWatchers.delete(rootRunId);
+    }
+    execution.treeContextState.watcherActive = false;
+  }
+
+  function broadcastTreeContextEvent(event: TreeContextEvent): number {
+    const watchers = treeContextWatchers.get(event.rootRunId);
+    if (!watchers || watchers.size === 0) return 0;
+    let notified = 0;
+    for (const executionId of Array.from(watchers)) {
+      const watcher = executions.get(executionId);
+      if (!watcher || isTerminal(watcher.status)) {
+        watchers.delete(executionId);
+        continue;
+      }
+      if (watcher.id === event.sourceRunId) continue;
+      normalizeTreeContextState(watcher);
+      if (event.revision <= watcher.treeContextState.lastBroadcastRevision) continue;
+      watcher.treeContextState.pendingRevision = Math.max(watcher.treeContextState.pendingRevision, event.revision);
+      watcher.treeContextState.lastBroadcastRevision = event.revision;
+      watcher.treeContextState.broadcastCount += 1;
+      watcher.dirtyRevision = Math.max(Number(watcher.dirtyRevision) || 0, event.revision);
+      const watcherAgent = agents.get(watcher.agentId);
+      if (watcherAgent) {
+        emitEvent(watcherAgent, watcher, "tree_context_broadcast", {
+          root_run_id: event.rootRunId,
+          revision: event.revision,
+          event_id: event.eventId,
+          source_agent_id: event.sourceAgentId,
+          source_run_id: event.sourceRunId,
+        });
+      }
+      notified += 1;
+    }
+    if (watchers.size === 0) treeContextWatchers.delete(event.rootRunId);
+    return notified;
+  }
+
+  function materializeTreeContext(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+  ): { turn: { kind: string; content: string } | null; revision: number; cursor: AgentContextCursor } {
+    const rootRunId = String(execution.rootRunId || execution.id || "").trim();
+    const hasTreePeer = Array.from(executions.values()).some((candidate) =>
+      candidate.id !== execution.id && String(candidate.rootRunId || candidate.id || "") === rootRunId
+    );
+    if (!hasTreePeer || typeof store.getAgentContextCursor !== "function" ||
+        typeof store.getTreeContextSnapshot !== "function" ||
+        typeof store.listTreeContextEvents !== "function") {
+      const cursor: AgentContextCursor = {
+        rootRunId,
+        agentId: agent.id,
+        lastAppliedRevision: 0,
+        dirtyRevision: Number(execution.dirtyRevision) || 0,
+        updatedAt: now(),
+      };
+      return { turn: null, revision: 0, cursor };
+    }
+    const existingCursor = rootRunId ? store.getAgentContextCursor(rootRunId, agent.id) : null;
+    const cursor: AgentContextCursor = existingCursor || {
+      rootRunId,
+      agentId: agent.id,
+      lastAppliedRevision: 0,
+      dirtyRevision: Number(execution.dirtyRevision) || 0,
+      updatedAt: now(),
+    };
+    if (!rootRunId) return { turn: null, revision: 0, cursor };
+    const snapshot = existingCursor ? null : store.getTreeContextSnapshot(rootRunId);
+    const snapshotEvents = Array.isArray(snapshot?.events) ? snapshot.events : [];
+    const incremental = store.listTreeContextEvents(rootRunId, cursor.lastAppliedRevision, MAX_TREE_CONTEXT_EVENTS);
+    const byId = new Map<string, TreeContextEvent>();
+    for (const event of [...snapshotEvents, ...incremental]) {
+      if (event && visibleTreeContextEvent(event, agent, execution)) byId.set(event.eventId, event);
+    }
+    const candidates = Array.from(byId.values())
+      .sort((left, right) => left.revision - right.revision || left.eventId.localeCompare(right.eventId))
+      .slice(0, MAX_TREE_CONTEXT_EVENTS);
+    if (candidates.length === 0) {
+      return { turn: null, revision: cursor.lastAppliedRevision, cursor };
+    }
+    const lines: string[] = [];
+    let remaining = MAX_TREE_CONTEXT_CHARS;
+    let revision = cursor.lastAppliedRevision;
+    for (const event of candidates) {
+      const body = treeContextPayload(event);
+      const fullEntry = `[revision=${event.revision} kind=${event.kind} source_agent=${event.sourceAgentId} source_run=${event.sourceRunId}]\n${body}`;
+      const entry = clipText(fullEntry, remaining);
+      if (!entry) break;
+      lines.push(entry);
+      remaining -= entry.length;
+      revision = Math.max(revision, Number(event.revision) || 0);
+      if (entry.length < fullEntry.length) break;
+    }
+    if (lines.length === 0) return { turn: null, revision: cursor.lastAppliedRevision, cursor };
+    const header = [
+      "TREE_SHARED_CONTEXT:",
+      `root_run_id=${rootRunId}`,
+      `materialized_revision=${revision}`,
+      snapshot?.truncated === true ? "older_entries_compacted=true" : "",
+    ].filter(Boolean).join("\n");
+    return {
+      turn: { kind: "USER", content: `${header}\n\n${lines.join("\n\n")}` },
+      revision,
+      cursor,
+    };
+  }
+
+  function sharedContextFor(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+  ): Array<{ kind: string; content: string }> {
+    const turns: Array<{ kind: string; content: string }> = [];
+    if (agent && agent.sharedContextEnabled === true && execution?.sharedContextChatId) {
+      try {
+        turns.push(...normalizeConversationContext(getConversationContext(execution.sharedContextChatId)));
+      } catch (error) {
+        persistenceError = persistenceError || `shared context unavailable: ${errorText(error)}`;
+      }
+    }
+    try {
+      const materialized = materializeTreeContext(agent, execution);
+      if (materialized.turn) turns.push(materialized.turn);
+      if (materialized.revision > materialized.cursor.lastAppliedRevision &&
+          typeof store.saveAgentContextCursor === "function") {
+        const cursor = store.saveAgentContextCursor({
+          ...materialized.cursor,
+          lastAppliedRevision: materialized.revision,
+          dirtyRevision: Math.max(materialized.cursor.dirtyRevision, materialized.revision),
+          updatedAt: now(),
+        });
+        normalizeTreeContextState(execution);
+        execution.treeContextState.appliedRevision = Math.max(
+          execution.treeContextState.appliedRevision,
+          cursor.lastAppliedRevision
+        );
+        if (execution.treeContextState.pendingRevision <= cursor.lastAppliedRevision) {
+          execution.treeContextState.pendingRevision = 0;
+        }
+        execution.dirtyRevision = Math.max(Number(execution.dirtyRevision) || 0, cursor.dirtyRevision);
+      }
+    } catch (error) {
+      persistenceError = persistenceError || `tree context unavailable: ${errorText(error)}`;
+    }
+    return turns;
+  }
+
+  function markTreeContextDirty(rootRunId: string, revision: number): void {
+    for (const candidate of agents.values()) {
+      for (const candidateExecution of candidate.executions) {
+        if ((candidateExecution.rootRunId || candidateExecution.id) !== rootRunId) continue;
+        candidateExecution.dirtyRevision = Math.max(Number(candidateExecution.dirtyRevision) || 0, revision);
+      }
+    }
+  }
+
+  function treeContextRefreshPending(execution: CollaborationExecution): boolean {
+    normalizeTreeContextState(execution);
+    return execution.treeContextState.pendingRevision > execution.treeContextState.appliedRevision;
+  }
+
+  function scheduleTreeContextRefresh(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    response: ModelStepResponse,
+  ): boolean {
+    if (!treeContextRefreshPending(execution) || execution.continuationRequired) return false;
+    const revision = execution.treeContextState.pendingRevision;
+    execution.treeContextState.refreshRevision = revision;
+    execution.treeContextState.refreshCount += 1;
+    execution.controlMode = "structured";
+    execution.controlStatus = "repaired";
+    execution.controlAction = "progress";
+    execution.controlEpoch = execution.epoch;
+    execution.controlSource = "tree_context_refresh";
+    execution.controlRepaired = true;
+    response.control = {
+      version: 1,
+      executionEpoch: execution.epoch,
+      action: "progress",
+      messageAcks: [],
+      error: "",
+    };
+    response.controlValid = true;
+    response.controlSource = "tree_context_refresh";
+    response.controlRepaired = true;
+    emitEvent(agent, execution, "tree_context_refresh_scheduled", {
+      root_run_id: execution.rootRunId || execution.id,
+      revision,
+      applied_revision: execution.treeContextState.appliedRevision,
+    });
+    return true;
+  }
+  function commitCheckpointContext(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    checkpoint: CollaborationCheckpoint,
+  ): TreeContextEvent | null {
+    const rootRunId = String(execution.rootRunId || execution.id || "").trim();
+    if (!rootRunId || !execution.id || !execution.epoch ||
+        checkpoint.diagnostics?.finalization_checkpoint === true ||
+        typeof store.appendTreeContextEvent !== "function") return null;
+    const committed = store.appendTreeContextEvent({
+      rootRunId,
+      sourceAgentId: agent.id,
+      sourceRunId: execution.id,
+      sourceEpoch: execution.epoch,
+      kind: "checkpoint",
+      visibility: "tree",
+      payload: {
+        step: checkpoint.step,
+        result: clipText(checkpoint.result, MAX_TREE_CONTEXT_EVENT_CHARS),
+        tool_names: Array.isArray(checkpoint.diagnostics?.tool_names) ? checkpoint.diagnostics.tool_names : [],
+        control_action: execution.controlAction,
+        control_source: execution.controlSource,
+        created_at: checkpoint.createdAt,
+      },
+      idempotencyKey: `checkpoint:${execution.id}:${checkpoint.step}`,
+      committedAt: checkpoint.createdAt,
+    }, { changedAgents: [agent] });
+    if (committed.checkpoint) Object.assign(checkpoint, committed.checkpoint);
+    markTreeContextDirty(rootRunId, committed.event.revision);
+    const notified = broadcastTreeContextEvent(committed.event);
+    checkpoint.treeContextBroadcasts = notified;
+    return committed.event;
+  }
+
+  function normalizeLifecycleToolName(value: unknown): string {
+    return String(value || "").trim();
+  }
+
+  function lifecycleToolNamesMatch(left: unknown, right: unknown): boolean {
+    const first = normalizeLifecycleToolName(left);
+    const second = normalizeLifecycleToolName(right);
+    if (!first || !second) return false;
+    if (first === second) return true;
+    return first.split(":").pop() === second.split(":").pop();
+  }
+
+  function normalizedToolResult(value: unknown): string {
+    const raw = typeof value === "string" ? value : (() => {
+      try {
+        return JSON.stringify(value);
+      } catch (_) {
+        return String(value || "");
+      }
+    })();
+    return clipText(safePublicResult(cleanAgentResult(raw)), MAX_TREE_CONTEXT_EVENT_CHARS);
+  }
+
+  function clearPendingToolInvocations(executionId: string): void {
+    for (const [invocationId, pending] of pendingToolInvocations) {
+      if (pending.executionId === executionId) pendingToolInvocations.delete(invocationId);
+    }
+  }
+
+  function trackToolInvocation(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    toolName: unknown,
+  ): PendingToolInvocation {
+    const invocationId = createId("tool_invocation");
+    const pending: PendingToolInvocation = {
+      invocationId,
+      hostInvocationId: "",
+      agentId: agent.id,
+      executionId: execution.id,
+      executionEpoch: execution.epoch,
+      toolName: normalizeLifecycleToolName(toolName),
+      createdAt: now(),
+    };
+    pendingToolInvocations.set(invocationId, pending);
+    return pending;
+  }
+
+  function pendingToolInvocationFor(payload: JsonRecord): PendingToolInvocation | null {
+    const agentId = String(payload.agent_id || "").trim();
+    const invocationId = String(payload.invocation_id || "").trim();
+    const toolName = normalizeLifecycleToolName(payload.tool_name);
+    if (!agentId || !toolName) return null;
+    if (invocationId) {
+      const direct = pendingToolInvocations.get(invocationId) || null;
+      if (direct && direct.agentId === agentId && lifecycleToolNamesMatch(direct.toolName, toolName)) return direct;
+      const byHostId = Array.from(pendingToolInvocations.values()).filter((pending) =>
+        pending.hostInvocationId === invocationId && pending.agentId === agentId && lifecycleToolNamesMatch(pending.toolName, toolName)
+      );
+      return byHostId.length === 1 ? byHostId[0] : null;
+    }
+    const candidates = Array.from(pendingToolInvocations.values()).filter((pending) =>
+      pending.agentId === agentId && lifecycleToolNamesMatch(pending.toolName, toolName)
+    );
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  function recordToolLifecycle(payloadValue: unknown): boolean {
+    const payload = asRecord(payloadValue);
+    const phase = String(payload.phase || "").trim().toLowerCase();
+    const agentId = String(payload.agent_id || "").trim();
+    const toolName = normalizeLifecycleToolName(payload.tool_name);
+    const hostInvocationId = String(payload.invocation_id || "").trim();
+    if (phase === "tool_execution_started") {
+      const candidates = Array.from(pendingToolInvocations.values()).filter((pending) =>
+        pending.agentId === agentId && lifecycleToolNamesMatch(pending.toolName, toolName) && !pending.hostInvocationId
+      );
+      if (candidates.length === 1 && hostInvocationId) candidates[0].hostInvocationId = hostInvocationId;
+      return candidates.length === 1;
+    }
+    const pending = pendingToolInvocationFor(payload);
+    if (!pending || (phase !== "tool_execution_result" && phase !== "tool_execution_error")) return false;
+    const agent = agents.get(pending.agentId);
+    const execution = agent ? latestExecution(agent) : null;
+    if (!agent || !execution || isTerminal(execution.status) || execution.cancelRequested ||
+        execution.id !== pending.executionId || execution.epoch !== pending.executionEpoch ||
+        !lifecycleToolNamesMatch(execution.currentTool, pending.toolName)) return false;
+    const succeeded = phase === "tool_execution_result" && payload.success !== false;
+    const result = succeeded
+      ? normalizedToolResult(payload.result_json === undefined ? payload.result_text : payload.result_json)
+      : clipText(safePublicResult(payload.error_message), 1000);
+    const idempotencyKey = `tool_result:${execution.id}:${pending.invocationId}`;
+    try {
+      const rootRunId = String(execution.rootRunId || execution.id || "").trim();
+      if (!rootRunId || typeof store.appendTreeContextEvent !== "function") return false;
+      const committed = store.appendTreeContextEvent({
+        rootRunId,
+        sourceAgentId: agent.id,
+        sourceRunId: execution.id,
+        sourceEpoch: execution.epoch,
+        kind: "tool_result",
+        visibility: "tree",
+        payload: {
+          invocation_id: pending.invocationId,
+          tool_name: pending.toolName,
+          status: succeeded ? "succeeded" : "failed",
+          result: result || undefined,
+          error: succeeded ? undefined : (result || "tool execution failed"),
+          completed_at: now(),
+        },
+        idempotencyKey,
+      }, { changedAgents: [agent] });
+      markTreeContextDirty(rootRunId, committed.event.revision);
+      const notified = broadcastTreeContextEvent(committed.event);
+      emitEvent(agent, execution, "tool_result", {
+        invocation_id: pending.invocationId,
+        tool_name: pending.toolName,
+        status: succeeded ? "succeeded" : "failed",
+        revision: committed.event.revision,
+        deduplicated: committed.deduplicated || undefined,
+        tree_context_broadcasts: notified || undefined,
+      });
+      pendingToolInvocations.delete(pending.invocationId);
+      persistAgent(agent);
+      return true;
+    } catch (error) {
+      persistenceError = persistenceError || `tool lifecycle persistence failed: ${errorText(error)}`;
+      return false;
+    }
+  }
+
+
+  function sharedContextReference(payload: JsonRecord, relation: JsonRecord = {}): string {
+    if (relation.parentAgentId) return String(relation.sharedContextChatId || "");
+    if (relation.sharedContextChatId) return String(relation.sharedContextChatId);
+    if (!sharedContextRequested(payload)) return "";
+    return String(payload && payload.parent_chat_id || "").trim();
   }
 
   function loadSettings() {
@@ -217,14 +864,14 @@ function createCollaborationManager(options = {}) {
       const raw = typeof store.getMeta === "function" ? store.getMeta(SETTINGS_META_KEY) : "";
       const parsed = raw ? JSON.parse(raw) : {};
       const maxConcurrentAgents = normalizeGlobalConcurrency(parsed.max_concurrent_agents);
+      const configuredPerRoot = parsed.max_active_runs_per_root === undefined
+        ? (maxConcurrentAgents === 0 ? DEFAULT_ACTIVE_RUNS_PER_ROOT : Math.min(DEFAULT_ACTIVE_RUNS_PER_ROOT, maxConcurrentAgents))
+        : normalizeActiveRunsPerRoot(parsed.max_active_runs_per_root, maxConcurrentAgents || DEFAULT_ACTIVE_RUNS_PER_ROOT);
       settings = {
         maxConcurrentAgents,
-        maxActiveRunsPerRoot: Math.min(
-          parsed.max_active_runs_per_root === undefined
-            ? DEFAULT_ACTIVE_RUNS_PER_ROOT
-            : normalizeActiveRunsPerRoot(parsed.max_active_runs_per_root, maxConcurrentAgents),
-          maxConcurrentAgents
-        ),
+        maxActiveRunsPerRoot: maxConcurrentAgents > 0 && configuredPerRoot > 0
+          ? Math.min(configuredPerRoot, maxConcurrentAgents)
+          : configuredPerRoot,
         maxToolCalls: normalizeGlobalMaxToolCalls(parsed.max_tool_calls),
         maxModelRetries: normalizeModelRetries(parsed.max_model_retries),
         conversationContextMode: normalizeConversationContextMode(parsed.conversation_context_mode),
@@ -242,10 +889,10 @@ function createCollaborationManager(options = {}) {
       max_model_retries: settings.maxModelRetries,
       conversation_context_mode: settings.conversationContextMode,
       conversation_context_modes: [...CONVERSATION_CONTEXT_MODES],
-      max_concurrent_agents_range: [MIN_GLOBAL_CONCURRENCY, MAX_GLOBAL_CONCURRENCY],
-      max_active_runs_per_root_range: [MIN_ACTIVE_RUNS_PER_ROOT, MAX_ACTIVE_RUNS_PER_ROOT],
-      max_tool_calls_range: [MIN_GLOBAL_MAX_TOOL_CALLS, MAX_GLOBAL_MAX_TOOL_CALLS],
-      max_model_retries_range: [MIN_MODEL_RETRIES, MAX_MODEL_RETRIES],
+      max_concurrent_agents_range: [0, MAX_GLOBAL_CONCURRENCY],
+      max_active_runs_per_root_range: [0, MAX_ACTIVE_RUNS_PER_ROOT],
+      max_tool_calls_range: [0, MAX_GLOBAL_MAX_TOOL_CALLS],
+      max_model_retries_range: [-1, MAX_MODEL_RETRIES],
       active_agents: active,
       queued_runs: queue.length,
       tool_limit_mode: "agent_prompt_budget",
@@ -257,11 +904,14 @@ function createCollaborationManager(options = {}) {
     return envelope({ settings: publicSettings() });
   }
 
-  function updateSettings(payload) {
-    if (!payload || typeof payload !== "object") throw new Error("settings request must be an object");
+  function updateSettings(payloadValue: unknown): ManagerEnvelope {
+    if (!payloadValue || typeof payloadValue !== "object") throw new Error("settings request must be an object");
+    const payload = asRecord(payloadValue);
     const maxConcurrentAgents = Number(payload.max_concurrent_agents);
     const maxActiveRunsPerRoot = payload.max_active_runs_per_root === undefined
-      ? Math.min(settings.maxActiveRunsPerRoot, maxConcurrentAgents)
+      ? (maxConcurrentAgents > 0 && settings.maxActiveRunsPerRoot > 0
+        ? Math.min(settings.maxActiveRunsPerRoot, maxConcurrentAgents)
+        : settings.maxActiveRunsPerRoot)
       : Number(payload.max_active_runs_per_root);
     const maxToolCalls = Number(payload.max_tool_calls);
     const maxModelRetries = payload.max_model_retries === undefined
@@ -270,24 +920,23 @@ function createCollaborationManager(options = {}) {
     const conversationContextMode = payload.conversation_context_mode === undefined
       ? settings.conversationContextMode
       : String(payload.conversation_context_mode || "").trim().toLowerCase();
-    if (!Number.isInteger(maxConcurrentAgents) || maxConcurrentAgents < MIN_GLOBAL_CONCURRENCY ||
-        maxConcurrentAgents > MAX_GLOBAL_CONCURRENCY) {
-      throw new Error(`max_concurrent_agents must be an integer between ${MIN_GLOBAL_CONCURRENCY} and ${MAX_GLOBAL_CONCURRENCY}`);
+    if (!Number.isInteger(maxConcurrentAgents) || (maxConcurrentAgents !== 0 &&
+        (maxConcurrentAgents < MIN_GLOBAL_CONCURRENCY || maxConcurrentAgents > MAX_GLOBAL_CONCURRENCY))) {
+      throw new Error(`max_concurrent_agents must be 0 (unlimited) or an integer between ${MIN_GLOBAL_CONCURRENCY} and ${MAX_GLOBAL_CONCURRENCY}`);
     }
-    if (!Number.isInteger(maxActiveRunsPerRoot) || maxActiveRunsPerRoot < MIN_ACTIVE_RUNS_PER_ROOT ||
-        maxActiveRunsPerRoot > MAX_ACTIVE_RUNS_PER_ROOT) {
-      throw new Error(`max_active_runs_per_root must be an integer between ${MIN_ACTIVE_RUNS_PER_ROOT} and ${MAX_ACTIVE_RUNS_PER_ROOT}`);
+    if (!Number.isInteger(maxActiveRunsPerRoot) || (maxActiveRunsPerRoot !== 0 &&
+        (maxActiveRunsPerRoot < MIN_ACTIVE_RUNS_PER_ROOT || maxActiveRunsPerRoot > MAX_ACTIVE_RUNS_PER_ROOT))) {
+      throw new Error(`max_active_runs_per_root must be 0 (unlimited) or an integer between ${MIN_ACTIVE_RUNS_PER_ROOT} and ${MAX_ACTIVE_RUNS_PER_ROOT}`);
     }
-    if (maxActiveRunsPerRoot > maxConcurrentAgents) {
-      throw new Error("max_active_runs_per_root must not exceed max_concurrent_agents");
+    if (maxConcurrentAgents > 0 && maxActiveRunsPerRoot > maxConcurrentAgents) {
+      throw new Error("max_active_runs_per_root must not exceed a finite max_concurrent_agents");
     }
-    if (!Number.isInteger(maxToolCalls) || maxToolCalls < MIN_GLOBAL_MAX_TOOL_CALLS ||
-        maxToolCalls > MAX_GLOBAL_MAX_TOOL_CALLS) {
-      throw new Error(`max_tool_calls must be an integer between ${MIN_GLOBAL_MAX_TOOL_CALLS} and ${MAX_GLOBAL_MAX_TOOL_CALLS}`);
+    if (!Number.isInteger(maxToolCalls) || (maxToolCalls !== 0 &&
+        (maxToolCalls < MIN_GLOBAL_MAX_TOOL_CALLS || maxToolCalls > MAX_GLOBAL_MAX_TOOL_CALLS))) {
+      throw new Error(`max_tool_calls must be 0 (unlimited) or an integer between ${MIN_GLOBAL_MAX_TOOL_CALLS} and ${MAX_GLOBAL_MAX_TOOL_CALLS}`);
     }
-    if (!Number.isInteger(maxModelRetries) || maxModelRetries < MIN_MODEL_RETRIES ||
-        maxModelRetries > MAX_MODEL_RETRIES) {
-      throw new Error(`max_model_retries must be an integer between ${MIN_MODEL_RETRIES} and ${MAX_MODEL_RETRIES}`);
+    if (!Number.isInteger(maxModelRetries) || maxModelRetries < -1 || maxModelRetries > MAX_MODEL_RETRIES) {
+      throw new Error(`max_model_retries must be -1 (unlimited) or an integer between ${MIN_MODEL_RETRIES} and ${MAX_MODEL_RETRIES}`);
     }
     if (!CONVERSATION_CONTEXT_MODES.has(conversationContextMode)) {
       throw new Error("conversation_context_mode must be off, on, or auto");
@@ -306,7 +955,7 @@ function createCollaborationManager(options = {}) {
     return envelope({ settings: publicSettings() });
   }
 
-  function envelope(value) {
+  function envelope(value: JsonRecord): ManagerEnvelope {
     return {
       success: true,
       persistence: store.mode,
@@ -332,7 +981,7 @@ function createCollaborationManager(options = {}) {
     persistAgents(Array.from(agents.values()));
   }
 
-  function persistAgents(changedAgents) {
+  function persistAgents(changedAgents: CollaborationAgent[]): boolean {
     try {
       if (typeof store.saveAgents === "function") store.saveAgents(changedAgents);
       else store.save(snapshot());
@@ -346,17 +995,17 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function persistAgent(agent) {
+  function persistAgent(agent: CollaborationAgent): boolean {
     return persistAgents([agent]);
   }
 
-  function requestId(payload) {
+  function requestId(payload: JsonRecord): string {
     const value = String(payload && payload.request_id || "").trim();
     if (value.length > 200) throw new Error("request_id must be at most 200 characters");
     return value;
   }
 
-  function priorRequest(operation, payload) {
+  function priorRequest(operation: string, payload: JsonRecord): JsonRecord | null {
     const id = requestId(payload);
     if (!id || typeof store.getRequest !== "function") return null;
     const fingerprint = operationFingerprint(operation, payload);
@@ -368,7 +1017,12 @@ function createCollaborationManager(options = {}) {
     return existing;
   }
 
-  function commitRequest(operation, payload, result, changedAgents) {
+  function commitRequest(
+    operation: string,
+    payload: JsonRecord,
+    result: JsonRecord,
+    changedAgents: CollaborationAgent[],
+  ): JsonRecord {
     const id = requestId(payload);
     if (!id || typeof store.commitRequest !== "function") {
       if (changedAgents && changedAgents.length > 0 && !persistAgents(changedAgents)) {
@@ -386,37 +1040,37 @@ function createCollaborationManager(options = {}) {
       persistenceError = store.mode === "memory" && store.reason
         ? `SQLite unavailable: ${store.reason}`
         : "";
-      return committed.record.result;
+      return asRecord(committed.record.result);
     } catch (error) {
       persistenceError = errorText(error);
       throw error;
     }
   }
 
-  function deduplicatedEnvelope(result, extra = {}) {
+  function deduplicatedEnvelope(result: unknown, extra: JsonRecord = {}): ManagerEnvelope {
     return envelope({
-      ...result,
+      ...asRecord(result),
       ...extra,
       delivery: "deduplicated",
       deduplicated: true,
     });
   }
 
-  function cloneMutableAgentState(agent) {
+  function cloneMutableAgentState(agent: CollaborationAgent): CollaborationAgent {
     return JSON.parse(JSON.stringify(agent));
   }
 
-  function restoreAgentState(agent, snapshot) {
+  function restoreAgentState(agent: CollaborationAgent, snapshot: CollaborationAgent): void {
     for (const key of Object.keys(agent)) delete agent[key];
     Object.assign(agent, snapshot);
     for (const execution of agent.executions) executions.set(execution.id, execution);
   }
 
-  function encodeListCursor(agent) {
+  function encodeListCursor(agent: CollaborationAgent): string {
     return `${Number(agent.createdAt) || 0}:${agent.id}`;
   }
 
-  function parseListCursor(value) {
+  function parseListCursor(value: unknown): ListCursor {
     const cursor = String(value || "").trim();
     if (!cursor) return null;
     const separator = cursor.indexOf(":");
@@ -430,27 +1084,27 @@ function createCollaborationManager(options = {}) {
     return { createdAt, agentId };
   }
 
-  function afterListCursor(agent, cursor) {
+  function afterListCursor(agent: CollaborationAgent, cursor: ListCursor): boolean {
     if (!cursor) return true;
     const createdAt = Number(agent.createdAt) || 0;
     return createdAt > cursor.createdAt || (createdAt === cursor.createdAt && agent.id > cursor.agentId);
   }
 
-  function requireAgent(agentId) {
+  function requireAgent(agentId: unknown): CollaborationAgent {
     const id = String(agentId || "").trim();
     const agent = agents.get(id);
     if (!agent) throw new Error(`agent not found: ${id}`);
     return agent;
   }
 
-  function currentExecutionForAgentId(agentId) {
+  function currentExecutionForAgentId(agentId: unknown): CollaborationExecution | null {
     const agent = agents.get(String(agentId || "").trim());
     return agent ? latestExecution(agent) : null;
   }
 
-  function normalizeActionGate(actionGate) {
+  function normalizeActionGate(actionGate: RuntimeActionGate): CollaborationActionGateState | null {
     if (!actionGate) return null;
-    const normalized = {
+    const normalized: JsonRecord = {
       kind: String(actionGate.kind || ""),
       allowed_tools: Array.from(new Set(
         (Array.isArray(actionGate.allowedTools) ? actionGate.allowedTools : [])
@@ -469,10 +1123,14 @@ function createCollaborationManager(options = {}) {
     if (Number(actionGate.failedAttempts) > 0) normalized.failed_attempts = Number(actionGate.failedAttempts);
     if (actionGate.unknownOutcome === true) normalized.unknown_outcome = true;
     normalized.fingerprint = JSON.stringify(normalized);
-    return normalized;
+    return normalized as CollaborationActionGateState;
   }
 
-  function syncActionGate(agent, execution, derivedGate = actionGateForAgent(agent, execution)) {
+  function syncActionGate(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    derivedGate: RuntimeActionGate = actionGateForAgent(agent, execution),
+  ): CollaborationActionGateState | null {
     if (!execution) return null;
     const previous = execution.currentActionGate && typeof execution.currentActionGate === "object"
       ? execution.currentActionGate
@@ -499,7 +1157,13 @@ function createCollaborationManager(options = {}) {
     return next;
   }
 
-  function recordActionGateBlocked(agent, execution, actionGate, gateViolations = [], details = {}) {
+  function recordActionGateBlocked(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    actionGate: Exclude<RuntimeActionGate, null>,
+    gateViolations: string[] = [],
+    details: JsonRecord = {},
+  ): CollaborationActionGateState | null {
     const current = syncActionGate(agent, execution, actionGate);
     execution.actionGateBlockCount = (Number(execution.actionGateBlockCount) || 0) + 1;
     emitEvent(agent, execution, "action_gate_blocked", {
@@ -509,9 +1173,10 @@ function createCollaborationManager(options = {}) {
       step: execution.stepCount,
       ...details,
     });
+    return current;
   }
 
-  function publicAgentWithTree(agent, includeResult = false, includeEvents = false) {
+  function publicAgentWithTree(agent: CollaborationAgent, includeResult = false, includeEvents = false): JsonRecord {
     const execution = latestExecution(agent);
     if (execution && !isTerminal(execution.status)) syncActionGate(agent, execution);
     return {
@@ -520,7 +1185,7 @@ function createCollaborationManager(options = {}) {
     };
   }
 
-  function treeSummary(agent) {
+  function treeSummary(agent: CollaborationAgent): JsonRecord {
     const execution = latestExecution(agent);
     const rootAgentId = execution && execution.rootAgentId ? execution.rootAgentId : agent.id;
     const rootRunId = execution && execution.rootRunId ? execution.rootRunId : (execution ? execution.id : "");
@@ -528,7 +1193,7 @@ function createCollaborationManager(options = {}) {
       const candidateRootRunId = candidate.rootRunId || (candidate.treeDepth === 0 ? candidate.id : "");
       return rootRunId && candidateRootRunId === rootRunId;
     });
-    const counts = {};
+    const counts: Record<string, number> = {};
     for (const memberExecution of memberExecutions) {
       counts[memberExecution.status] = (counts[memberExecution.status] || 0) + 1;
     }
@@ -543,7 +1208,7 @@ function createCollaborationManager(options = {}) {
     };
   }
 
-  function relationForParent(payload) {
+  function relationForParent(payload: JsonRecord): JsonRecord {
     const parentAgentId = String(payload && payload.parent_agent_id || "").trim();
     if (!parentAgentId) {
       return {
@@ -553,6 +1218,7 @@ function createCollaborationManager(options = {}) {
         rootAgentId: "",
         rootRunId: "",
         treeDepth: 0,
+        sharedContextChatId: "",
       };
     }
     const parentAgent = requireAgent(parentAgentId);
@@ -570,7 +1236,7 @@ function createCollaborationManager(options = {}) {
     ).length;
     if (directChildren >= MAX_DIRECT_CHILDREN) throw new Error(`parent run direct child limit exceeded (${MAX_DIRECT_CHILDREN})`);
     const seen = new Set([parentAgent.id]);
-    let current = parentAgent;
+    let current: CollaborationAgent | undefined = parentAgent;
     while (current && current.parentAgentId) {
       if (seen.has(current.parentAgentId)) throw new Error("parent agent relationship contains a cycle");
       seen.add(current.parentAgentId);
@@ -583,15 +1249,23 @@ function createCollaborationManager(options = {}) {
       rootAgentId,
       rootRunId: parentExecution.rootRunId || parentExecution.id,
       treeDepth,
+      sharedContextChatId: parentAgent.sharedContextEnabled === true
+        ? parentExecution.sharedContextChatId || parentAgent.parentChatId || ""
+        : "",
     };
   }
-  function indexAgent(agent) {
+  function indexAgent(agent: CollaborationAgent): void {
     agents.set(agent.id, agent);
     for (const execution of agent.executions) executions.set(execution.id, execution);
   }
 
-  function beginRecoveryAttempt(agent, execution, reason) {
+  function beginRecoveryAttempt(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    reason: string,
+  ): RecoveryRecord {
     const timestamp = now();
+    normalizeStreamState(execution);
     const priorAttempt = execution.attempt;
     const priorEpoch = execution.epoch;
     const priorRecord = {
@@ -645,6 +1319,22 @@ function createCollaborationManager(options = {}) {
     execution.resultSuppressed = false;
     execution.continuationRepairCount = 0;
     execution.continuationRepairStreak = 0;
+    execution.dirtyRevision = Math.max(0, Math.floor(Number(execution.dirtyRevision) || 0));
+    execution.streamState = {
+      requestAttempt: 0,
+      streamSeq: 0,
+      offset: 0,
+      status: "idle",
+      publicText: "",
+      promptEchoSuppressed: false,
+      startedAt: 0,
+      updatedAt: 0,
+      completedAt: 0,
+    };
+    normalizeTreeContextState(execution);
+    execution.treeContextState.watcherActive = false;
+    execution.treeContextState.pendingRevision = 0;
+    execution.treeContextState.refreshRevision = 0;
     execution.lastStepDiagnostics = null;
     execution.messageDeliveryWarning = "";
     execution.controlMode = "compatibility";
@@ -675,28 +1365,39 @@ function createCollaborationManager(options = {}) {
   function recover() {
     const loaded = store.load();
     if (!loaded || !Array.isArray(loaded.agents)) return;
-    const loadedExecutions = new Map();
-    for (const rawAgent of loaded.agents) {
-      for (const rawExecution of Array.isArray(rawAgent && rawAgent.executions) ? rawAgent.executions : []) {
-        if (rawExecution && rawExecution.id) loadedExecutions.set(rawExecution.id, rawExecution);
+    const loadedExecutions = new Map<string, CollaborationExecution>();
+    for (const rawAgentValue of loaded.agents) {
+      const rawAgent = asRecord(rawAgentValue);
+      const rawExecutions = Array.isArray(rawAgent.executions) ? rawAgent.executions : [];
+      for (const rawExecutionValue of rawExecutions) {
+        const rawExecution = asRecord(rawExecutionValue);
+        if (rawExecution.id) {
+          loadedExecutions.set(String(rawExecution.id), rawExecution as CollaborationExecution);
+        }
       }
     }
-    function recoveredRootRunId(execution) {
+    function recoveredRootRunId(execution: CollaborationExecution): string {
       if (execution.rootRunId) return String(execution.rootRunId);
-      let current = execution;
-      const seen = new Set();
-      while (current && current.parentRunId && !seen.has(current.parentRunId)) {
+      let current: CollaborationExecution | null = execution;
+      const seen = new Set<string>();
+      while (current?.parentRunId && !seen.has(current.parentRunId)) {
         seen.add(current.parentRunId);
         current = loadedExecutions.get(current.parentRunId) || null;
       }
-      return String(current && current.id || execution.id || "");
+      return String(current?.id || execution.id || "");
     }
     let changed = false;
-    const recoveryAttemptRecords = [];
-    const recoveredQueueEntries = [];
-    const existingQueueEntries = [];
+    const recoveryAttemptRecords: RecoveryRecord[] = [];
+    const recoveredQueueEntries: QueueEntry[] = [];
+    const existingQueueEntries: QueueEntry[] = [];
 
-    function orphanActiveRun(agent, execution, reason, error, effects = []) {
+    function orphanActiveRun(
+      agent: CollaborationAgent,
+      execution: CollaborationExecution,
+      reason: string,
+      error: string,
+      effects: EffectRecord[] = [],
+    ): void {
       execution.status = "orphaned";
       execution.physicalStatus = "orphaned";
       execution.error = error;
@@ -717,7 +1418,10 @@ function createCollaborationManager(options = {}) {
       });
     }
 
-    function interruptRecoveredCancellation(agent, execution) {
+    function interruptRecoveredCancellation(
+      agent: CollaborationAgent,
+      execution: CollaborationExecution,
+    ): void {
       execution.status = "interrupted";
       execution.physicalStatus = "terminal";
       execution.error = "ToolPkg runtime restarted while cancellation was pending; the host call stack was not resumed";
@@ -733,8 +1437,9 @@ function createCollaborationManager(options = {}) {
       });
     }
 
-    for (const raw of loaded.agents) {
-      if (!raw || !raw.id) continue;
+    for (const rawValue of loaded.agents) {
+      const raw = asRecord(rawValue);
+      if (!raw.id) continue;
       const agent = {
         ...raw,
         requestId: String(raw.requestId || ""),
@@ -767,18 +1472,22 @@ function createCollaborationManager(options = {}) {
           })
           : [],
         history: Array.isArray(raw.history) ? raw.history : [],
+        outbox: Array.isArray(raw.outbox) ? raw.outbox : [],
         events: Array.isArray(raw.events) ? raw.events : [],
         executions: Array.isArray(raw.executions) ? raw.executions : [],
         targetPaths: Array.isArray(raw.targetPaths) ? raw.targetPaths : [],
         parentChatId: String(raw.parentChatId || ""),
-      };
+        sharedContextEnabled: raw.sharedContextEnabled === true,
+      } as CollaborationAgent;
       for (const execution of agent.executions) {
         execution.checkpoints = Array.isArray(execution.checkpoints) ? execution.checkpoints : [];
-        const recoveredConversationContext = normalizeConversationContext(execution.conversationContext);
-        if (recoveredConversationContext.length !== (Array.isArray(execution.conversationContext) ? execution.conversationContext.length : 0)) {
+        if (Object.prototype.hasOwnProperty.call(execution, "conversationContext")) {
+          delete execution.conversationContext;
           changed = true;
         }
-        execution.conversationContext = recoveredConversationContext;
+        execution.sharedContextChatId = agent.sharedContextEnabled === true
+          ? String(execution.sharedContextChatId || agent.parentChatId || "")
+          : "";
         execution.parentRunId = String(execution.parentRunId || "");
         execution.parentExecutionEpoch = String(execution.parentExecutionEpoch || "");
         execution.rootAgentId = String(execution.rootAgentId || agent.id);
@@ -812,6 +1521,21 @@ function createCollaborationManager(options = {}) {
         execution.actionGateActivationCount = Math.max(0, Math.floor(Number(execution.actionGateActivationCount) || 0));
         execution.actionGateBlockCount = Math.max(0, Math.floor(Number(execution.actionGateBlockCount) || 0));
         execution.continuationRepairStreak = Math.max(0, Math.floor(Number(execution.continuationRepairStreak) || 0));
+        execution.dirtyRevision = Math.max(0, Math.floor(Number(execution.dirtyRevision) || 0));
+        normalizeStreamState(execution);
+        if (execution.streamState.status === "streaming") {
+          emitEvent(agent, execution, "model_stream_recovered_interrupted", {
+            epoch: execution.epoch,
+            request_attempt: execution.streamState.requestAttempt,
+            stream_seq: execution.streamState.streamSeq,
+            offset: execution.streamState.offset,
+          });
+          execution.streamState.status = "interrupted";
+          execution.streamState.updatedAt = now();
+          execution.streamState.completedAt = execution.streamState.updatedAt;
+        }
+        normalizeTreeContextState(execution);
+        execution.treeContextState.watcherActive = false;
         execution.lastStepDiagnostics = execution.lastStepDiagnostics && typeof execution.lastStepDiagnostics === "object"
           ? execution.lastStepDiagnostics
           : null;
@@ -898,7 +1622,7 @@ function createCollaborationManager(options = {}) {
     if (queue.length > 0) Promise.resolve().then(pump);
   }
 
-  function assertNoPathConflict(targetPaths, excludeAgentId) {
+  function assertNoPathConflict(targetPaths: string[] | undefined, excludeAgentId?: string): void {
     if (!targetPaths || targetPaths.length === 0) return;
     for (const other of agents.values()) {
       if (other.id === excludeAgentId || other.readOnly || isTerminal(other.status)) continue;
@@ -912,7 +1636,11 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function enqueue(agent, execution, options = {}) {
+  function enqueue(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    options: { deferCommit?: boolean } = {},
+  ): void {
     executions.set(execution.id, execution);
     queue.push({
       agentId: agent.id,
@@ -939,22 +1667,23 @@ function createCollaborationManager(options = {}) {
     pump();
   }
 
-  function rootActiveCount(rootRunId) {
+  function rootActiveCount(rootRunId: unknown): number {
     return activeByRoot.get(String(rootRunId || "").trim()) || 0;
   }
 
-  function canStartEntry(entry) {
+  function canStartEntry(entry: QueueEntry): boolean {
     const root = String(entry.rootRunId || entry.executionId || "").trim();
-    return rootActiveCount(root) < settings.maxActiveRunsPerRoot;
+    return settings.maxActiveRunsPerRoot === 0 || rootActiveCount(root) < settings.maxActiveRunsPerRoot;
   }
 
-  function queueRank(entry) {
-    const priorityRank = PRIORITY_RANK[entry.priority] ?? PRIORITY_RANK.normal;
+  function queueRank(entry: QueueEntry): number {
+    const priority = entry.priority === "high" || entry.priority === "low" ? entry.priority : "normal";
+    const priorityRank = PRIORITY_RANK[priority] ?? PRIORITY_RANK.normal;
     const ageBonus = Math.min(2, Math.floor((now() - Number(entry.enqueuedAt || now())) / QUEUE_AGING_STEP_MS));
     return priorityRank - ageBonus;
   }
 
-  function takeNextQueueEntry() {
+  function takeNextQueueEntry(): QueueEntry | null {
     let bestIndex = -1;
     let bestRank = Number.POSITIVE_INFINITY;
     let bestRoot = "";
@@ -975,11 +1704,14 @@ function createCollaborationManager(options = {}) {
     return queue.splice(bestIndex, 1)[0];
   }
 
-  function pendingMessages(agent) {
+  function pendingMessages(agent: CollaborationAgent): CollaborationMessage[] {
     return agent.inbox.filter((message) => message.status === "queued");
   }
 
-  function stageMessages(agent, execution) {
+  function stageMessages(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+  ): CollaborationMessage[] {
     const messages = pendingMessages(agent);
     for (const message of messages) {
       message.status = "inflight";
@@ -990,7 +1722,11 @@ function createCollaborationManager(options = {}) {
     return messages;
   }
 
-  function confirmMessages(agent, execution, messages) {
+  function confirmMessages(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    messages: CollaborationMessage[],
+  ): void {
     const deliveredAt = now();
     for (const message of messages) {
       if (message.status !== "inflight") continue;
@@ -1008,8 +1744,13 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function acknowledgeMessages(agent, execution, messages, acknowledgedIds) {
-    const ids = new Set((acknowledgedIds || []).map((id) => String(id || "").trim()));
+  function acknowledgeMessages(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    messages: CollaborationMessage[],
+    acknowledgedIds: string[],
+  ): void {
+    const ids = new Set(acknowledgedIds.map((id) => String(id || "").trim()));
     const acknowledgedAt = now();
     for (const message of messages) {
       if (!ids.has(message.id)) continue;
@@ -1020,7 +1761,11 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function requeueUnacknowledgedMessages(agent, execution, messages) {
+  function requeueUnacknowledgedMessages(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    messages: CollaborationMessage[],
+  ): { requeued: number; exhausted: number } {
     let requeued = 0;
     let exhausted = 0;
     for (const message of messages) {
@@ -1044,7 +1789,11 @@ function createCollaborationManager(options = {}) {
     return { requeued, exhausted };
   }
 
-  function requeueMessages(agent, execution, messages) {
+  function requeueMessages(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    messages: CollaborationMessage[],
+  ): void {
     for (const message of messages) {
       if (message.status !== "inflight") continue;
       message.status = "queued";
@@ -1054,12 +1803,129 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function modelErrorText(error) {
+  function routeOutboundMessages(
+    sourceAgent: CollaborationAgent,
+    sourceExecution: CollaborationExecution,
+    requestedMessages: OutboundControlMessage[],
+  ): RouteOutboundResult {
+    const changedAgents = new Map<string, CollaborationAgent>([[sourceAgent.id, sourceAgent]]);
+    const results: RoutedMessage[] = [];
+    if (!Array.isArray(sourceAgent.outbox)) sourceAgent.outbox = [];
+    for (const requested of Array.isArray(requestedMessages) ? requestedMessages : []) {
+      const deliveryKey = `outbound_message:${sourceAgent.id}:${sourceExecution.epoch}:${requested.id}`;
+      const requestFingerprint = JSON.stringify({
+        target: requested.target,
+        agent_id: requested.agentId || "",
+        content: requested.content,
+      });
+      const prior = sourceAgent.outbox.find((entry) => entry.deliveryKey === deliveryKey);
+      if (prior) {
+        if (prior.requestFingerprint !== requestFingerprint) {
+          throw new Error(`outbound message_id conflict: ${requested.id}`);
+        }
+        results.push({ message_id: requested.id, status: prior.status, deduplicated: true });
+        continue;
+      }
+      const record = {
+        id: requested.id,
+        deliveryKey,
+        requestFingerprint,
+        target: requested.target,
+        targetAgentId: "",
+        content: requested.content,
+        sourceRunId: sourceExecution.id,
+        sourceEpoch: sourceExecution.epoch,
+        status: "pending",
+        error: "",
+        createdAt: now(),
+      };
+      try {
+        if (requested.target === "main") {
+          record.status = "delivered_to_main";
+          sourceAgent.outbox.push(record);
+          emitEvent(sourceAgent, sourceExecution, "main_message_queued", {
+            message_id: requested.id,
+            source_epoch: sourceExecution.epoch,
+          });
+          results.push({ message_id: requested.id, target: "main", status: record.status });
+          continue;
+        }
+        const targetAgentId = requested.target === "parent"
+          ? sourceAgent.parentAgentId
+          : requested.target === "root"
+            ? sourceExecution.rootAgentId
+            : requested.agentId;
+        if (!targetAgentId) throw new Error(`outbound target ${requested.target} is unavailable`);
+        if (targetAgentId === sourceAgent.id) throw new Error("outbound messages cannot target the sender");
+        const targetAgent = requireAgent(targetAgentId);
+        const targetExecution = latestExecution(targetAgent);
+        if (!targetExecution || isTerminal(targetAgent.status) || targetAgent.status === "cancelling") {
+          throw new Error(`target agent ${targetAgentId} is not active`);
+        }
+        const sourceRootRunId = sourceExecution.rootRunId || sourceExecution.id;
+        const targetRootRunId = targetExecution.rootRunId || targetExecution.id;
+        if (sourceRootRunId !== targetRootRunId) throw new Error("outbound target is outside the current task tree");
+        const inboundId = `message_${deliveryKey}`;
+        if (!targetAgent.inbox.some((message) => message.id === inboundId)) {
+          targetAgent.inbox.push({
+            id: inboundId,
+            content: requested.content,
+            sourceAgentId: sourceAgent.id,
+            sourceRunId: sourceExecution.id,
+            sourceEpoch: sourceExecution.epoch,
+            status: "queued",
+            createdAt: record.createdAt,
+            deliveredAt: 0,
+            deliveredRunSeq: 0,
+            deliveredStep: 0,
+            deliveryAttempts: 0,
+            acknowledged: false,
+            acknowledgedAt: 0,
+            lastDeliveredRunSeq: 0,
+            lastDeliveredStep: 0,
+          });
+          emitEvent(targetAgent, targetExecution, "message_queued", {
+            message_id: inboundId,
+            source_agent_id: sourceAgent.id,
+            source_run_id: sourceExecution.id,
+          });
+        }
+        record.targetAgentId = targetAgent.id;
+        record.status = "queued_for_next_checkpoint";
+        sourceAgent.outbox.push(record);
+        changedAgents.set(targetAgent.id, targetAgent);
+        emitEvent(sourceAgent, sourceExecution, "outbound_message_queued", {
+          message_id: requested.id,
+          target_agent_id: targetAgent.id,
+        });
+        results.push({
+          message_id: requested.id,
+          target_agent_id: targetAgent.id,
+          status: record.status,
+        });
+      } catch (error) {
+        record.status = "rejected";
+        record.error = errorText(error);
+        sourceAgent.outbox.push(record);
+        emitEvent(sourceAgent, sourceExecution, "outbound_message_rejected", {
+          message_id: requested.id,
+          target: requested.target,
+          error: record.error,
+        });
+        results.push({ message_id: requested.id, status: record.status, error: record.error });
+      }
+    }
+    return { changedAgents: Array.from(changedAgents.values()), results };
+  }
+
+  function modelErrorText(error: unknown): string {
     if (!error) return "unknown model error";
     if (error instanceof Error && error.message) return String(error.message);
     if (typeof error === "object") {
+      const record = asRecord(error);
       for (const key of ["message", "error", "detail", "body", "response"]) {
-        if (typeof error[key] === "string" && error[key].trim()) return error[key].trim();
+        const value = record[key];
+        if (typeof value === "string" && value.trim()) return value.trim();
       }
       try {
         const serialized = JSON.stringify(error);
@@ -1069,12 +1935,14 @@ function createCollaborationManager(options = {}) {
     return String(error);
   }
 
-  function modelErrorStatus(error, text) {
+  function modelErrorStatus(error: unknown, text: string): number {
+    const record = asRecord(error);
+    const response = asRecord(record.response);
     const candidates = [
-      error && error.status,
-      error && error.statusCode,
-      error && error.httpStatus,
-      error && error.response && error.response.status,
+      record.status,
+      record.statusCode,
+      record.httpStatus,
+      response.status,
     ];
     for (const value of candidates) {
       const status = Number(value);
@@ -1085,11 +1953,13 @@ function createCollaborationManager(options = {}) {
     return match ? Number(match[1]) : 0;
   }
 
-  function modelErrorRetryAfterMs(error, text) {
+  function modelErrorRetryAfterMs(error: unknown, text: string): number {
+    const record = asRecord(error);
+    const response = asRecord(record.response);
     const values = [
-      error && error.retryAfterMs,
-      error && error.retry_after_ms,
-      error && error.response && error.response.retryAfterMs,
+      record.retryAfterMs,
+      record.retry_after_ms,
+      response.retryAfterMs,
     ];
     for (const value of values) {
       const delay = Number(value);
@@ -1100,7 +1970,7 @@ function createCollaborationManager(options = {}) {
     return Math.min(MODEL_RETRY_MAX_DELAY_MS, Math.max(0, Math.floor(Number(seconds[1]) * 1000)));
   }
 
-  function classifyModelError(error) {
+  function classifyModelError(error: unknown): ModelErrorClassification {
     const text = modelErrorText(error);
     const normalized = text.toLowerCase();
     const status = modelErrorStatus(error, text);
@@ -1116,19 +1986,22 @@ function createCollaborationManager(options = {}) {
     };
   }
 
-  function modelRetryDelayMs(retryIndex, retryAfterMs = 0) {
+  function modelRetryDelayMs(retryIndex: number, retryAfterMs = 0): number {
     if (retryAfterMs > 0) return retryAfterMs;
     const exponential = Math.min(MODEL_RETRY_MAX_DELAY_MS, MODEL_RETRY_BASE_DELAY_MS * (2 ** Math.max(0, retryIndex - 1)));
     const jitter = 1 + ((Math.random() * 2 - 1) * MODEL_RETRY_JITTER_RATIO);
     return Math.max(0, Math.round(exponential * jitter));
   }
 
-  function waitForModelRetry(execution, delayMs) {
+  function waitForModelRetry(
+    execution: CollaborationExecution,
+    delayMs: number,
+  ): Promise<boolean> {
     if (execution.cancelRequested) return Promise.resolve(false);
-    return new Promise((resolve) => {
-      const waiter = {
+    return new Promise<boolean>((resolve) => {
+      const waiter: RetryWaiter = {
         timeoutId: null,
-        resolve(value) {
+        resolve(value: boolean) {
           if (modelRetryWaiters.get(execution.id) !== waiter) return;
           modelRetryWaiters.delete(execution.id);
           if (waiter.timeoutId !== null) clearTimeout(waiter.timeoutId);
@@ -1140,12 +2013,157 @@ function createCollaborationManager(options = {}) {
     });
   }
 
-  function cancelModelRetryWait(execution) {
-    const waiter = execution && modelRetryWaiters.get(execution.id);
+  function cancelModelRetryWait(execution: CollaborationExecution): void {
+    const waiter = modelRetryWaiters.get(execution.id);
     if (waiter && typeof waiter.resolve === "function") waiter.resolve(false);
   }
 
-  async function executeModelStepWithRetry(agent, execution, messages, callbacks) {
+  function flushModelDelta(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    accumulator: StreamAccumulator,
+    force = false,
+    final = false,
+  ): void {
+    if (!accumulator.pendingDelta) return;
+    const timestamp = now();
+    if (!force && accumulator.pendingDelta.length < STREAM_DELTA_FLUSH_CHARS &&
+        timestamp - accumulator.lastFlushAt < STREAM_DELTA_FLUSH_MS) {
+      if (accumulator.flushTimer === null) {
+        accumulator.flushTimer = setTimeout(() => {
+          accumulator.flushTimer = null;
+          if (streamAccumulators.get(execution.id) === accumulator) {
+            flushModelDelta(agent, execution, accumulator, true);
+          }
+        }, STREAM_DELTA_FLUSH_MS);
+      }
+      return;
+    }
+    if (accumulator.flushTimer !== null) {
+      clearTimeout(accumulator.flushTimer);
+      accumulator.flushTimer = null;
+    }
+    while (accumulator.pendingDelta) {
+      const delta = accumulator.pendingDelta.slice(0, MAX_STREAM_DELTA_EVENT_CHARS);
+      accumulator.pendingDelta = accumulator.pendingDelta.slice(delta.length);
+      accumulator.lastFlushAt = timestamp;
+      emitEvent(agent, execution, "model_delta", {
+        epoch: accumulator.epoch,
+        request_attempt: accumulator.requestAttempt,
+        stream_seq: accumulator.streamSeq,
+        offset: execution.streamState.offset - accumulator.pendingDelta.length,
+        delta,
+      });
+      if (!force && accumulator.pendingDelta.length < STREAM_DELTA_FLUSH_CHARS) break;
+    }
+    if (accumulator.pendingDelta && accumulator.flushTimer === null) {
+      accumulator.flushTimer = setTimeout(() => {
+        accumulator.flushTimer = null;
+        if (streamAccumulators.get(execution.id) === accumulator) {
+          flushModelDelta(agent, execution, accumulator, true);
+        }
+      }, STREAM_DELTA_FLUSH_MS);
+    }
+    if (force || timestamp - accumulator.lastPersistAt >= STREAM_SNAPSHOT_PERSIST_MS) {
+      accumulator.lastPersistAt = timestamp;
+      persistAgent(agent);
+    }
+  }
+
+  function beginModelStream(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    requestAttempt: number,
+  ): StreamAccumulator {
+    normalizeStreamState(execution);
+    const timestamp = now();
+    const streamSeq = execution.streamState.streamSeq + 1;
+    execution.streamState = {
+      requestAttempt,
+      streamSeq,
+      offset: 0,
+      status: "streaming",
+      publicText: "",
+      promptEchoSuppressed: false,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: 0,
+    };
+    const accumulator: StreamAccumulator = {
+      executionId: execution.id,
+      epoch: execution.epoch,
+      requestAttempt,
+      streamSeq,
+      pendingDelta: "",
+      lastFlushAt: timestamp,
+      lastPersistAt: timestamp,
+      flushTimer: null,
+    };
+    streamAccumulators.set(execution.id, accumulator);
+    emitEvent(agent, execution, "model_stream_started", {
+      epoch: execution.epoch,
+      request_attempt: requestAttempt,
+      stream_seq: streamSeq,
+      checkpoint_step: execution.stepCount + 1,
+    });
+    persistAgent(agent);
+    return accumulator;
+  }
+
+  function appendModelDelta(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    accumulator: StreamAccumulator,
+    delta: string,
+  ): void {
+    if (!delta || streamAccumulators.get(execution.id) !== accumulator ||
+        execution.epoch !== accumulator.epoch || execution.cancelRequested ||
+        agent.currentExecutionId !== execution.id || isTerminal(execution.status)) return;
+    execution.streamState.offset += delta.length;
+    execution.streamState.publicText = `${execution.streamState.publicText}${delta}`.slice(-MAX_STREAM_PUBLIC_CHARS);
+    execution.streamState.updatedAt = now();
+    accumulator.pendingDelta += delta;
+    flushModelDelta(agent, execution, accumulator);
+  }
+
+  function endModelStream(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    accumulator: StreamAccumulator,
+    status: "completed" | "interrupted",
+    promptEchoSuppressed: boolean,
+  ): void {
+    if (streamAccumulators.get(execution.id) !== accumulator || execution.epoch !== accumulator.epoch) return;
+    const cancelledOrReplaced = execution.cancelRequested || agent.currentExecutionId !== execution.id;
+    const effectiveStatus = cancelledOrReplaced ? "interrupted" : status;
+    const effectivePromptEchoSuppressed = cancelledOrReplaced
+      ? execution.streamState.promptEchoSuppressed
+      : promptEchoSuppressed;
+    flushModelDelta(agent, execution, accumulator, true);
+    streamAccumulators.delete(execution.id);
+    const timestamp = now();
+    execution.streamState.status = effectiveStatus;
+    execution.streamState.promptEchoSuppressed = effectivePromptEchoSuppressed;
+    execution.streamState.updatedAt = timestamp;
+    execution.streamState.completedAt = timestamp;
+    if (effectivePromptEchoSuppressed) execution.streamState.publicText = "";
+    emitEvent(agent, execution, "model_stream_ended", {
+      epoch: accumulator.epoch,
+      request_attempt: accumulator.requestAttempt,
+      stream_seq: accumulator.streamSeq,
+      offset: execution.streamState.offset,
+      status: effectiveStatus,
+      prompt_echo_suppressed: effectivePromptEchoSuppressed || undefined,
+    });
+    persistAgent(agent);
+  }
+
+  async function executeModelStepWithRetry(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    messages: CollaborationMessage[],
+    callbacks: ModelStepCallbacks,
+  ): Promise<ModelStepResponse> {
     let priorAccepted = false;
     let toolsInvoked = false;
     let requestAttempt = 0;
@@ -1160,6 +2178,7 @@ function createCollaborationManager(options = {}) {
       });
       persistAgent(agent);
       try {
+        let streamAccumulator: StreamAccumulator | null = null;
         const response = await executeModelStep(agent, execution, messages, {
           ...callbacks,
           finalizationHandoff: callbacks.finalizationHandoff,
@@ -1175,22 +2194,36 @@ function createCollaborationManager(options = {}) {
             priorAccepted = true;
             if (callbacks.onAccepted) callbacks.onAccepted();
           },
+          onStreamStart() {
+            streamAccumulator = beginModelStream(agent, execution, requestAttempt);
+          },
+          onStreamDelta(delta) {
+            if (streamAccumulator) appendModelDelta(agent, execution, streamAccumulator, delta);
+          },
+          onStreamEnd(status, promptEchoSuppressed) {
+            if (streamAccumulator) {
+              endModelStream(agent, execution, streamAccumulator, status, promptEchoSuppressed);
+              streamAccumulator = null;
+            }
+          },
           onToolInvocation(toolName) {
             toolsInvoked = true;
             if (callbacks.onToolInvocation) callbacks.onToolInvocation(toolName);
           },
         });
         response.diagnostics = {
-          ...(response.diagnostics || {}),
+          ...((response.diagnostics || {}) as Record<string, any>),
           model_request_attempt: requestAttempt,
           model_request_retries: requestAttempt - 1,
-        };
+        } as any;
         execution.currentModelRequestAttempt = 0;
         return response;
       } catch (error) {
         const classification = classifyModelError(error);
         const retryAccepted = priorAccepted;
-        const canRetry = classification.retryable && requestAttempt <= settings.maxModelRetries && !execution.cancelRequested;
+        const canRetry = classification.retryable &&
+          (settings.maxModelRetries === -1 || requestAttempt <= settings.maxModelRetries) &&
+          !execution.cancelRequested;
         emitEvent(agent, execution, "model_request_failed", {
           checkpoint_step: execution.stepCount + 1,
           request_attempt: requestAttempt,
@@ -1202,7 +2235,7 @@ function createCollaborationManager(options = {}) {
         persistAgent(agent);
         if (!canRetry) {
           execution.currentModelRequestAttempt = 0;
-          const terminalError = error instanceof Error ? error : new Error(classification.text);
+          const terminalError: Error & { modelRequestAccepted?: boolean } = error instanceof Error ? error : new Error(classification.text);
           terminalError.modelRequestAccepted = priorAccepted;
           throw terminalError;
         }
@@ -1225,7 +2258,7 @@ function createCollaborationManager(options = {}) {
         persistAgent(agent);
         const shouldContinue = await waitForModelRetry(execution, delayMs);
         if (!shouldContinue) {
-          const cancelled = new Error("model retry cancelled");
+          const cancelled: Error & { modelRequestAccepted?: boolean } = new Error("model retry cancelled");
           cancelled.modelRequestAccepted = retryAccepted;
           throw cancelled;
         }
@@ -1233,8 +2266,14 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function finishExecution(agent, execution, status, error = "") {
+  function finishExecution(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    status: string,
+    error = "",
+  ): void {
     if (isTerminal(execution.status)) return;
+    clearPendingToolInvocations(execution.id);
     syncActionGate(agent, execution, null);
     execution.status = status;
     execution.physicalStatus = "terminal";
@@ -1244,29 +2283,36 @@ function createCollaborationManager(options = {}) {
     agent.status = status;
     agent.lastError = error;
     if (status === "completed") agent.lastResult = execution.result;
+    unregisterTreeContextWatcher(execution);
     appendHistory(agent, execution);
     emitEvent(agent, execution, "run_terminal", { status, error });
     persistAgent(agent);
     resolveWaiters();
   }
 
-  function actionCheckpointTurns(execution) {
+  function actionCheckpointTurns(execution: CollaborationExecution): number {
     return (execution.checkpoints || []).reduce(
-      (count, checkpoint) => count + (checkpoint?.diagnostics?.finalization_checkpoint === true ? 0 : 1),
+      (count: number, checkpoint) => count + (
+        checkpoint?.diagnostics?.finalization_checkpoint === true || checkpoint?.treeContextRefresh === true ? 0 : 1
+      ),
       0
     );
   }
 
-  function hasActionCheckpointBudget(execution) {
+  function hasActionCheckpointBudget(execution: CollaborationExecution): boolean {
     return actionCheckpointTurns(execution) < MAX_ACTION_CHECKPOINT_TURNS;
   }
 
-  async function execute(agent, execution) {
+  async function execute(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+  ): Promise<void> {
     let pendingFinalizationHandoff = "";
     execution.status = "running";
     execution.physicalStatus = "running";
     execution.startedAt = now();
     agent.status = "running";
+    registerTreeContextWatcher(execution);
     emitEvent(agent, execution, "attempt_started", {
       epoch: execution.epoch,
       attempt: execution.attempt,
@@ -1281,27 +2327,35 @@ function createCollaborationManager(options = {}) {
         persistAgent(agent);
         let accepted = false;
         let response;
+        normalizeTreeContextState(execution);
+        const requestAppliedRevision = execution.treeContextState.appliedRevision;
+        const treeContextRefreshStep = execution.treeContextState.refreshRevision > requestAppliedRevision;
         try {
           response = await executeModelStepWithRetry(agent, execution, messages, {
             finalizationHandoff: execution.continuationRequired ? pendingFinalizationHandoff : "",
+            getSharedContext() {
+              return sharedContextFor(agent, execution);
+            },
             onAccepted() {
               accepted = true;
               if (agent.currentExecutionId !== execution.id || isTerminal(execution.status)) return;
               confirmMessages(agent, execution, messages);
               persistAgent(agent);
             },
-            onToolInvocation(toolName) {
+            onToolInvocation(toolName: string) {
         if (agent.currentExecutionId !== execution.id || isTerminal(execution.status)) return;
         execution.toolCount += 1;
         execution.currentTool = toolName;
+        const pending = trackToolInvocation(agent, execution, toolName);
         try {
           onAgentToolInvocation({
             agent_id: agent.id,
             execution_epoch: execution.epoch,
             tool_name: toolName,
+            invocation_id: pending.invocationId,
           });
         } catch (_) {}
-        emitEvent(agent, execution, "tool_started", { tool_name: toolName });
+        emitEvent(agent, execution, "tool_started", { tool_name: toolName, invocation_id: pending.invocationId });
         persistAgent(agent);
       },
             onSummaryStarted() {
@@ -1320,7 +2374,7 @@ function createCollaborationManager(options = {}) {
             },
           });
         } catch (error) {
-          if (!accepted && error?.modelRequestAccepted !== true) {
+          if (!accepted && (error as { modelRequestAccepted?: boolean } | null)?.modelRequestAccepted !== true) {
             requeueMessages(agent, execution, messages);
             persistAgent(agent);
           }
@@ -1387,15 +2441,19 @@ function createCollaborationManager(options = {}) {
         const modelRetryVerificationActive = execution.retryVerificationPending === true;
         const actionGate = actionGateForAgent(agent, execution);
         if (modelRetryVerificationActive && stepTools.length > 0) clearModelRetryVerification(execution);
-        const normalizedStepTools = stepTools.map((toolName) => String(toolName).split(":").at(-1));
+        const normalizedStepTools = stepTools.map((toolName) => {
+          const parts = String(toolName).split(":");
+          return parts[parts.length - 1];
+        });
         if (actionGate?.kind === "pending_mutation" && normalizedStepTools.includes("edit_file")) {
           const receipts = response.evidence?.version === 1
             ? (response.evidence.mutation_receipts || []).filter((receipt) => receipt?.tool === "edit_file")
             : [];
-          const mutationStatus = String(receipts.at(-1)?.status || "unknown");
+          const latestReceipt = receipts[receipts.length - 1];
+          const mutationStatus = String(latestReceipt?.status || "unknown");
           const terminalMutationError = mutationStatus === "unknown"
             ? "edit_file outcome is unknown; verify the assigned target state before a follow-up mutation"
-            : (mutationStatus === "failed" && actionGate.failedAttempts + 1 >= MAX_SCOPED_MUTATION_FAILURES
+            : (mutationStatus === "failed" && (actionGate.failedAttempts || 0) + 1 >= MAX_SCOPED_MUTATION_FAILURES
               ? `scoped edit_file retry limit exceeded (${MAX_SCOPED_MUTATION_FAILURES})`
               : "");
           if (terminalMutationError) {
@@ -1413,7 +2471,7 @@ function createCollaborationManager(options = {}) {
         const gateViolations = actionGate
           ? stepTools.filter((toolName) => !actionGateToolAllowed(actionGate, toolName))
           : [];
-        if (gateViolations.length > 0) {
+        if (gateViolations.length > 0 && actionGate) {
           recordActionGateBlocked(agent, execution, actionGate, gateViolations);
           execution.controlAction = "progress";
           execution.controlSource = "action_gate_repair";
@@ -1447,19 +2505,32 @@ function createCollaborationManager(options = {}) {
         execution.messageDeliveryWarning = acknowledgement.exhausted > 0
           ? `${acknowledgement.exhausted} parent message(s) were presented twice but not acknowledged by the model`
           : "";
-        const checkpoint = {
+        const checkpoint: CollaborationCheckpoint = {
           step: execution.stepCount,
           result: response.result,
           diagnostics: response.diagnostics || null,
           evidence: response.evidence || null,
           createdAt: now(),
         };
+        if (treeContextRefreshStep) checkpoint.treeContextRefresh = true;
         execution.checkpoints.push(checkpoint);
         const postCheckpointActionGate = actionGateForAgent(agent, execution);
         syncActionGate(agent, execution, postCheckpointActionGate);
         const completionRequested = control?.action === "finish" ||
           (!control && !execution.continuationRequired && pendingMessages(agent).length === 0);
-        if (postCheckpointActionGate && completionRequested) {
+        const originalControl = control;
+        const contextSyncEligible = !execution.continuationRequired &&
+          !checkpoint.diagnostics?.finalization_checkpoint &&
+          execution.treeContextState.pendingRevision > requestAppliedRevision;
+        const refreshRequested = (completionRequested || contextSyncEligible) &&
+          execution.treeContextState.pendingRevision > requestAppliedRevision &&
+          scheduleTreeContextRefresh(agent, execution, response);
+        if (refreshRequested) {
+          checkpoint.treeContextRefresh = true;
+          checkpoint.treeContextRefreshRevision = execution.treeContextState.refreshRevision;
+          control = response.controlValid ? response.control : null;
+        }
+        if (postCheckpointActionGate && completionRequested && !refreshRequested) {
           const requestedControlAction = control?.action || "compatibility_finish";
           recordActionGateBlocked(agent, execution, postCheckpointActionGate, [], {
             reason: "premature_completion",
@@ -1494,6 +2565,29 @@ function createCollaborationManager(options = {}) {
           execution.continuationRequired = false;
           control = response.control;
         }
+        const requestedOutboundMessages = Array.isArray(response.outboundMessages)
+          ? response.outboundMessages
+          : [];
+        if (requestedOutboundMessages.length > 0) {
+          const priorStates = new Map(Array.from(agents.values()).map((candidate) => [
+            candidate.id,
+            cloneMutableAgentState(candidate),
+          ]));
+          let routed;
+          try {
+            routed = routeOutboundMessages(agent, execution, requestedOutboundMessages);
+            if (!persistAgents(routed.changedAgents)) {
+              throw new Error(`failed to persist outbound messages: ${persistenceError}`);
+            }
+          } catch (error) {
+            for (const [agentId, priorState] of priorStates) {
+              const candidate = agents.get(agentId);
+              if (candidate) restoreAgentState(candidate, priorState);
+            }
+            throw error;
+          }
+          checkpoint.outboundDeliveries = routed.results;
+        }
         emitEvent(agent, execution, "model_step_classified", response.diagnostics || {});
         emitEvent(agent, execution, "checkpoint", {
           step: execution.stepCount,
@@ -1508,7 +2602,23 @@ function createCollaborationManager(options = {}) {
           continuation_required: execution.continuationRequired,
           continuation_repair_count: execution.continuationRepairCount,
         });
-        persistAgent(agent);
+        if (checkpoint.diagnostics?.finalization_checkpoint === true || refreshRequested || treeContextRefreshStep) {
+          if (!persistAgent(agent)) throw new Error(`failed to persist checkpoint: ${persistenceError}`);
+        } else {
+          try {
+            const treeEvent = commitCheckpointContext(agent, execution, checkpoint);
+            if (treeEvent) checkpoint.treeContextRevision = treeEvent.revision;
+          } catch (error) {
+            execution.checkpoints.pop();
+            throw new Error(`tree context checkpoint commit failed: ${errorText(error)}`);
+          }
+        }
+        if (treeContextRefreshStep && !treeContextRefreshPending(execution)) {
+          execution.treeContextState.refreshRevision = 0;
+        }
+        if (refreshRequested && originalControl?.action === "finish") {
+          checkpoint.treeContextDeferredControl = "finish";
+        }
         if (control && control.action === "fail") {
           finishExecution(agent, execution, "failed", control.error);
           return;
@@ -1561,7 +2671,7 @@ function createCollaborationManager(options = {}) {
 
   function pump() {
     if (shuttingDown) return;
-    while (active < settings.maxConcurrentAgents && queue.length > 0) {
+    while ((settings.maxConcurrentAgents === 0 || active < settings.maxConcurrentAgents) && queue.length > 0) {
       const entry = takeNextQueueEntry();
       if (!entry) break;
       const agent = agents.get(entry.agentId);
@@ -1579,13 +2689,13 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function selectedIds(payload) {
-    const value = payload && payload.agent_ids;
+  function selectedIds(payload: JsonRecord): string[] {
+    const value = payload.agent_ids;
     if (!Array.isArray(value) || value.length === 0) throw new Error("agent_ids must be a non-empty array");
     return Array.from(new Set(value.map((item) => String(item || "").trim()).filter(Boolean)));
   }
 
-  function waitResult(ids, timedOut) {
+  function waitResult(ids: string[], timedOut: boolean): WaitResult {
     return envelope({
       timed_out: timedOut || undefined,
       agents: ids.map((id) => {
@@ -1605,9 +2715,9 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function spawn(payload) {
-    if (!payload || typeof payload !== "object") throw new Error("request must be an object");
-    payload = { ...payload };
+  function spawn(payloadValue: unknown): ManagerEnvelope {
+    if (!payloadValue || typeof payloadValue !== "object") throw new Error("request must be an object");
+    const payload = { ...asRecord(payloadValue) };
     const task = String(payload.task || "").trim();
     if (!task) throw new Error("task is required");
     const requestKey = requestId(payload);
@@ -1627,17 +2737,20 @@ function createCollaborationManager(options = {}) {
     }
     const fingerprint = requestFingerprint(payload);
     const relation = relationForParent(payload);
+    const sharedContextChatId = sharedContextReference(payload, relation);
     const agent = createAgent({
       ...payload,
       max_tool_calls: settings.maxToolCalls,
       parent_agent_id: relation.parentAgentId,
+      parent_chat_id: sharedContextChatId,
+      shared_context_enabled: !!sharedContextChatId,
       request_id: requestKey,
       request_fingerprint: fingerprint,
     });
+    relation.sharedContextChatId = sharedContextChatId;
     assertNoPathConflict(agent.readOnly ? [] : agent.targetPaths, "");
     indexAgent(agent);
-    const execution = createExecution(agent, task, String(payload.context || "").trim(), relation,
-      conversationContextFor({ ...payload, parent_agent_id: relation.parentAgentId }));
+    const execution = createExecution(agent, task, String(payload.context || "").trim(), relation);
     emitEvent(agent, execution, "agent_created", {
       parent_agent_id: agent.parentAgentId,
       parent_run_id: execution.parentRunId,
@@ -1664,8 +2777,8 @@ function createCollaborationManager(options = {}) {
     return envelope(result);
   }
 
-  function listSummary(filtered) {
-    const statusCounts = {};
+  function listSummary(filtered: CollaborationAgent[]): JsonRecord {
+    const statusCounts: Record<string, number> = {};
     for (const agent of filtered) {
       statusCounts[agent.status] = (statusCounts[agent.status] || 0) + 1;
     }
@@ -1684,8 +2797,9 @@ function createCollaborationManager(options = {}) {
     };
   }
 
-  function list(payload) {
-    const requestedIds = payload && Array.isArray(payload.agent_ids)
+  function list(payloadValue: unknown): ManagerEnvelope {
+    const payload = asRecord(payloadValue);
+    const requestedIds = Array.isArray(payload.agent_ids)
       ? new Set(payload.agent_ids.map((id) => String(id || "").trim()).filter(Boolean))
       : null;
     const requestedStatus = String((payload && payload.status) || "").trim();
@@ -1703,13 +2817,12 @@ function createCollaborationManager(options = {}) {
       });
     }
     const rawLimit = payload && payload.limit !== undefined ? Number(payload.limit) : DEFAULT_LIST_LIMIT;
-    if (!Number.isFinite(rawLimit) || !Number.isInteger(rawLimit) || rawLimit <= 0 || rawLimit > MAX_LIST_LIMIT) {
-      throw new Error(`limit must be an integer between 1 and ${MAX_LIST_LIMIT}`);
+    if (!Number.isFinite(rawLimit) || !Number.isInteger(rawLimit) || rawLimit < 0 || rawLimit > MAX_LIST_LIMIT) {
+      throw new Error(`limit must be 0 (unlimited) or an integer between 1 and ${MAX_LIST_LIMIT}`);
     }
-    const limit = rawLimit;
     const cursor = parseListCursor(payload && payload.cursor);
     const remaining = filtered.filter((agent) => afterListCursor(agent, cursor));
-    const page = remaining.slice(0, limit);
+    const page = rawLimit === 0 ? remaining : remaining.slice(0, rawLimit);
     const hasMore = remaining.length > page.length;
     return envelope({
       ...listSummary(filtered),
@@ -1720,7 +2833,8 @@ function createCollaborationManager(options = {}) {
     });
   }
 
-  function sendMessage(payload) {
+  function sendMessage(payloadValue: unknown): ManagerEnvelope {
+    const payload = asRecord(payloadValue);
     const ledgerEntry = priorRequest("send_message", payload);
     if (ledgerEntry) return deduplicatedEnvelope(ledgerEntry.result);
     const agent = requireAgent(payload && payload.agent_id);
@@ -1765,9 +2879,13 @@ function createCollaborationManager(options = {}) {
     return envelope(result);
   }
 
-  function followup(payload) {
-    const agent = requireAgent(payload && payload.agent_id);
-    payload = { ...payload, parent_chat_id: String(payload && payload.parent_chat_id || agent.parentChatId || "").trim() };
+  function followup(payloadValue: unknown): ManagerEnvelope {
+    const input = asRecord(payloadValue);
+    const agent = requireAgent(input.agent_id);
+    const payload: JsonRecord = {
+      ...input,
+      parent_chat_id: String(input.parent_chat_id || agent.parentChatId || "").trim(),
+    };
     const ledgerEntry = priorRequest("followup_task", payload);
     if (ledgerEntry) return deduplicatedEnvelope(ledgerEntry.result);
     if (!isTerminal(agent.status)) {
@@ -1814,13 +2932,16 @@ function createCollaborationManager(options = {}) {
       message.deliveryAttempts = 0;
       emitEvent(agent, null, "message_requeued_for_followup", { message_id: message.id });
     }
+    agent.parentChatId = String(payload.parent_chat_id || agent.parentChatId || "").trim();
+    agent.sharedContextEnabled = sharedContextRequested(payload) && !!agent.parentChatId;
     const execution = createExecution(agent, task, String(payload.context || "").trim(), {
       parentRunId: "",
       parentExecutionEpoch: "",
       rootAgentId: agent.id,
       rootRunId: "",
       treeDepth: 0,
-    }, conversationContextFor(payload));
+      sharedContextChatId: agent.sharedContextEnabled ? agent.parentChatId : "",
+    });
     emitEvent(agent, execution, "followup_created", { prior_run_seq: execution.seq - 1 });
     enqueue(agent, execution, { deferCommit: true });
     const result = {
@@ -1840,26 +2961,36 @@ function createCollaborationManager(options = {}) {
     return envelope(result);
   }
 
-  function wait(payload) {
+  function wait(payloadValue: unknown): Promise<WaitResult> {
+    const payload = asRecord(payloadValue);
     const ids = selectedIds(payload);
     ids.forEach(requireAgent);
     if (ids.every((id) => isTerminal(requireAgent(id).status))) return Promise.resolve(waitResult(ids, false));
     const requested = Number(payload.timeout_ms ?? DEFAULT_WAIT_MS);
-    const timeoutMs = Number.isFinite(requested)
-      ? Math.max(1000, Math.min(MAX_WAIT_MS, Math.floor(requested)))
-      : DEFAULT_WAIT_MS;
-    return new Promise((resolve) => {
-      const waiter = { ids, resolve, timeoutId: null };
-      waiter.timeoutId = setTimeout(() => {
-        const index = waiters.indexOf(waiter);
-        if (index >= 0) waiters.splice(index, 1);
-        resolve(waitResult(ids, true));
-      }, timeoutMs);
+    if (!Number.isFinite(requested) || !Number.isInteger(requested) || requested < 0 ||
+        (requested !== 0 && (requested < 1000 || requested > MAX_WAIT_MS))) {
+      throw new Error(`timeout_ms must be 0 (unlimited) or an integer between 1000 and ${MAX_WAIT_MS}`);
+    }
+    return new Promise<WaitResult>((resolve) => {
+      const waiter: Waiter = { ids, resolve, timeoutId: null };
+      if (requested > 0) {
+        waiter.timeoutId = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          resolve(waitResult(ids, true));
+        }, requested);
+      }
       waiters.push(waiter);
     });
   }
 
-  function interruptDescendant(agent, execution, parentExecutionId, priorStates, servicesToCancel) {
+  function interruptDescendant(
+    agent: CollaborationAgent,
+    execution: CollaborationExecution,
+    parentExecutionId: string,
+    priorStates: PriorAgentStates,
+    servicesToCancel: ServiceKeySet,
+  ): boolean {
     if (!execution || isTerminal(execution.status)) return false;
     if (!priorStates.has(agent.id)) priorStates.set(agent.id, cloneMutableAgentState(agent));
     execution.cancelRequested = true;
@@ -1870,6 +3001,7 @@ function createCollaborationManager(options = {}) {
       root_run_id: execution.rootRunId || execution.id,
     });
     if (execution.status === "queued") {
+      clearPendingToolInvocations(execution.id);
       execution.status = "interrupted";
       execution.physicalStatus = "terminal";
       execution.error = "cancelled by parent agent";
@@ -1888,12 +3020,16 @@ function createCollaborationManager(options = {}) {
     return true;
   }
 
-  function interruptTreeDescendants(parentExecution, priorStates, servicesToCancel) {
-    const changed = [];
+  function interruptTreeDescendants(
+    parentExecution: CollaborationExecution,
+    priorStates: PriorAgentStates,
+    servicesToCancel: ServiceKeySet,
+  ): CollaborationAgent[] {
+    const changed: CollaborationAgent[] = [];
     for (const candidate of agents.values()) {
       const execution = latestExecution(candidate);
       if (!execution || execution.id === parentExecution.id) continue;
-      let current = execution;
+      let current: CollaborationExecution | null = execution;
       const seen = new Set();
       while (current && current.parentRunId && !seen.has(current.parentRunId)) {
         if (current.parentRunId === parentExecution.id) {
@@ -1914,7 +3050,8 @@ function createCollaborationManager(options = {}) {
     return changed;
   }
 
-  function interrupt(payload) {
+  function interrupt(payloadValue: unknown): ManagerEnvelope {
+    const payload = asRecord(payloadValue);
     const ledgerEntry = priorRequest("interrupt_agent", payload);
     if (ledgerEntry) return deduplicatedEnvelope(ledgerEntry.result);
     const agent = requireAgent(payload && payload.agent_id);
@@ -1927,9 +3064,9 @@ function createCollaborationManager(options = {}) {
       commitRequest("interrupt_agent", payload, result, []);
       return envelope(result);
     }
-    const priorStates = new Map([[agent.id, cloneMutableAgentState(agent)]]);
+    const priorStates: PriorAgentStates = new Map([[agent.id, cloneMutableAgentState(agent)]]);
     const priorQueue = queue.map((entry) => ({ ...entry }));
-    const servicesToCancel = new Set();
+    const servicesToCancel: ServiceKeySet = new Set();
     execution.cancelRequested = true;
     cancelModelRetryWait(execution);
     const descendants = interruptTreeDescendants(execution, priorStates, servicesToCancel);
@@ -1939,6 +3076,7 @@ function createCollaborationManager(options = {}) {
     });
     let result;
     if (execution.status === "queued") {
+      clearPendingToolInvocations(execution.id);
       execution.status = "interrupted";
       execution.physicalStatus = "terminal";
       execution.error = "cancelled before start";
@@ -1979,41 +3117,41 @@ function createCollaborationManager(options = {}) {
     return envelope(result);
   }
 
-  function executionRootRunId(execution) {
-    return execution && (execution.rootRunId || ((Number(execution.treeDepth) || 0) === 0 ? execution.id : ""));
+  function executionRootRunId(execution: CollaborationExecution): string {
+    return String(execution.rootRunId || ((Number(execution.treeDepth) || 0) === 0 ? execution.id : ""));
   }
 
-  function activeRootRunIds() {
+  function activeRootRunIds(): Set<string> {
     return new Set(Array.from(executions.values())
       .filter((execution) => execution && !isTerminal(execution.status))
       .map(executionRootRunId)
       .filter(Boolean));
   }
 
-  function agentTouchesRoots(agent, rootRunIds) {
-    return Array.isArray(agent && agent.executions) && agent.executions.some(
-      (execution) => rootRunIds.has(executionRootRunId(execution))
+  function agentTouchesRoots(agent: CollaborationAgent, rootRunIds: Set<string>): boolean {
+    return agent.executions.some(
+      (execution: CollaborationExecution) => rootRunIds.has(executionRootRunId(execution))
     );
   }
 
   function protectedAgentIdsForActiveWork() {
     const activeRoots = activeRootRunIds();
-    const protectedIds = new Set();
+    const protectedIds = new Set<string>();
     for (const agent of agents.values()) {
       if (!isTerminal(agent.status) || agentTouchesRoots(agent, activeRoots)) protectedIds.add(agent.id);
     }
     for (const agentId of Array.from(protectedIds)) {
-      let parentId = agents.get(agentId) && agents.get(agentId).parentAgentId;
+      let parentId = agents.get(agentId)?.parentAgentId || "";
       while (parentId && !protectedIds.has(parentId)) {
         protectedIds.add(parentId);
-        parentId = agents.get(parentId) && agents.get(parentId).parentAgentId;
+        parentId = agents.get(parentId)?.parentAgentId || "";
       }
     }
     return protectedIds;
   }
 
-  function resolveRemovalWaiters(agentIds) {
-    const removed = new Set(agentIds);
+  function resolveRemovalWaiters(agentIds: string[]) {
+    const removed = new Set<string>(agentIds);
     for (let index = waiters.length - 1; index >= 0; index -= 1) {
       const waiter = waiters[index];
       if (!waiter.ids.some((id) => removed.has(id))) continue;
@@ -2024,8 +3162,8 @@ function createCollaborationManager(options = {}) {
     }
   }
 
-  function removeAgents(agentIds) {
-    const ids = Array.from(new Set(agentIds)).filter((id) => agents.has(id));
+  function removeAgents(agentIds: string[]): string[] {
+    const ids = Array.from(new Set<string>(agentIds)).filter((id) => agents.has(id));
     if (ids.length === 0) return [];
     try {
       store.deleteAgents(ids);
@@ -2045,8 +3183,9 @@ function createCollaborationManager(options = {}) {
     return ids;
   }
 
-  function deleteAgent(payload) {
-    const agent = requireAgent(payload && payload.agent_id);
+  function deleteAgent(payloadValue: unknown): ManagerEnvelope {
+    const payload = asRecord(payloadValue);
+    const agent = requireAgent(payload.agent_id);
     if (!isTerminal(agent.status)) throw new Error(`agent ${agent.id} is ${agent.status}; only terminal agents can be deleted`);
     const protectedIds = protectedAgentIdsForActiveWork();
     if (protectedIds.has(agent.id)) {
@@ -2099,14 +3238,16 @@ function createCollaborationManager(options = {}) {
     return envelope({ deleted: deleted.length, deleted_agent_ids: deleted });
   }
 
-  function inspect(payload) {
-    const agent = requireAgent(payload && payload.agent_id);
+  function inspect(payloadValue: unknown): ManagerEnvelope {
+    const payload = asRecord(payloadValue);
+    const agent = requireAgent(payload.agent_id);
     return envelope({ agent: publicAgentWithTree(agent, true, true) });
   }
 
-  function listTree(payload) {
-    const requestedRootRunId = String(payload && payload.root_run_id || "").trim();
-    const requestedAgentId = String(payload && payload.agent_id || "").trim();
+  function listTree(payloadValue: unknown): ManagerEnvelope {
+    const payload = asRecord(payloadValue);
+    const requestedRootRunId = String(payload.root_run_id || "").trim();
+    const requestedAgentId = String(payload.agent_id || "").trim();
     let rootRunId = requestedRootRunId;
     if (!rootRunId && requestedAgentId) {
       const execution = latestExecution(requireAgent(requestedAgentId));
@@ -2141,7 +3282,53 @@ function createCollaborationManager(options = {}) {
     return envelope({ root_run_id: rootRunId, nodes });
   }
 
-  function getActionGate(agentId) {
+  function watchTreeEvents(payloadValue: unknown): ManagerEnvelope | Promise<ManagerEnvelope> {
+    const payload = asRecord(payloadValue);
+    const requestedRootRunId = String(payload.root_run_id || "").trim();
+    const requestedAgentId = String(payload.agent_id || "").trim();
+    let rootRunId = requestedRootRunId;
+    if (!rootRunId && requestedAgentId) {
+      const execution = latestExecution(requireAgent(requestedAgentId));
+      if (!execution) throw new Error(`agent ${requestedAgentId} has no current run`);
+      rootRunId = rootRunIdForExecution(execution);
+    }
+    if (!rootRunId) throw new Error("root_run_id or agent_id is required");
+    const exists = Array.from(executions.values()).some((execution) => rootRunIdForExecution(execution) === rootRunId);
+    if (!exists) throw new Error(`task tree not found: ${rootRunId}`);
+    const afterRevision = payload.after_revision === undefined ? 0 : Number(payload.after_revision);
+    if (!Number.isSafeInteger(afterRevision) || afterRevision < 0) {
+      throw new Error("after_revision must be a non-negative safe integer");
+    }
+    const limit = payload.limit === undefined ? DEFAULT_TREE_EVENT_LIMIT : Number(payload.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_TREE_EVENT_LIMIT) {
+      throw new Error(`limit must be an integer between 1 and ${MAX_TREE_EVENT_LIMIT}`);
+    }
+    const timeoutMs = payload.timeout_ms === undefined ? DEFAULT_TREE_EVENT_WAIT_MS : Number(payload.timeout_ms);
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TREE_EVENT_WAIT_MS) {
+      throw new Error(`timeout_ms must be an integer between 0 and ${MAX_TREE_EVENT_WAIT_MS}`);
+    }
+    const immediate = treeEventBatch(rootRunId, afterRevision, limit);
+    if (immediate.snapshot_required === true || (Array.isArray(immediate.events) && immediate.events.length > 0) || timeoutMs === 0) {
+      return envelope({ ...immediate, timed_out: false });
+    }
+    return new Promise<ManagerEnvelope>((resolve) => {
+      const waiter: TreeEventWaiter = {
+        rootRunId,
+        afterRevision,
+        limit,
+        resolve,
+        timeoutId: null,
+      };
+      waiter.timeoutId = setTimeout(() => {
+        const index = treeEventWaiters.indexOf(waiter);
+        if (index >= 0) treeEventWaiters.splice(index, 1);
+        resolve(envelope({ ...treeEventBatch(rootRunId, afterRevision, limit), timed_out: true }));
+      }, timeoutMs);
+      treeEventWaiters.push(waiter);
+    });
+  }
+
+  function getActionGate(agentId: unknown): RuntimeActionGate {
     const agent = agents.get(String(agentId || "").trim());
     const execution = agent ? latestExecution(agent) : null;
     if (!agent || !execution || isTerminal(execution.status)) return null;
@@ -2155,9 +3342,26 @@ function createCollaborationManager(options = {}) {
       const execution = latestExecution(agent);
       if (!execution || isTerminal(agent.status) || execution.status === "queued") continue;
       execution.cancelRequested = true;
+      unregisterTreeContextWatcher(execution);
       cancelModelRetryWait(execution);
       cancelService(execution.serviceKey);
     }
+    treeEventWaiters.splice(0).forEach((waiter) => {
+      clearTimeout(waiter.timeoutId);
+      waiter.resolve(envelope({
+        ...treeEventBatch(waiter.rootRunId, waiter.afterRevision, waiter.limit),
+        timed_out: true,
+        shutdown: true,
+      }));
+    });
+    treeContextWatchers.clear();
+    treeEventHistory.clear();
+    treeEventRevisions.clear();
+    for (const accumulator of streamAccumulators.values()) {
+      if (accumulator.flushTimer !== null) clearTimeout(accumulator.flushTimer);
+    }
+    streamAccumulators.clear();
+    pendingToolInvocations.clear();
     persist();
     store.close();
     return { ok: true };
@@ -2176,7 +3380,9 @@ function createCollaborationManager(options = {}) {
     interrupt,
     list,
     listTree,
+    recordToolLifecycle,
     sendMessage,
+    watchTreeEvents,
     shutdown,
     spawn,
     updateSettings,
@@ -2190,8 +3396,21 @@ function createCollaborationManager(options = {}) {
       queueRank,
       classifyModelError,
       modelRetryDelayMs,
+      routeOutboundMessages,
+      sharedContextFor,
+      treeContextWatchers,
+      treeEventHistory,
+      treeEventRevisions,
+      treeEventWaiters,
+      registerTreeContextWatcher,
+      unregisterTreeContextWatcher,
+      broadcastTreeContextEvent,
+      clearPendingToolInvocations,
+      pendingToolInvocations,
+      recordToolLifecycle,
+      normalizeTreeContextState,
+      treeContextRefreshPending,
+      scheduleTreeContextRefresh,
     },
   };
 }
-
-module.exports = { createCollaborationManager };

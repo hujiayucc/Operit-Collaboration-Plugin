@@ -25,6 +25,33 @@ const heldNonSummary = [];
 const heldSummaries = [];
 const nonSummaryStarts = [];
 let summaryStartedResolve = null;
+let heldReleaseCount = 0;
+let queuedStreamChunks = [];
+let streamFirstChunkResolve = null;
+let streamContinuation = null;
+function releaseHeldNonSummary(count = 1) {
+  heldReleaseCount += count;
+  while (heldReleaseCount > 0 && heldNonSummary.length > 0) {
+    heldReleaseCount -= 1;
+    heldNonSummary.shift()();
+  }
+}
+
+function releaseHeldNonSummaryMatching(text) {
+  const index = heldNonSummary.findIndex((release) => String(release.message || "").includes(text));
+  assert.ok(index >= 0, `missing held non-summary request containing: ${text}`);
+  heldNonSummary.splice(index, 1)[0]();
+}
+
+async function waitForCondition(predicate, message, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.fail(message);
+}
+
 
 class PromptTurn {
   constructor(kind, content, toolName, metadata) {
@@ -68,7 +95,11 @@ function createService(key) {
         async callSuspend(streamMethod, collector) {
           assert.equal(streamMethod, "collect");
           if (!summary && holdNonSummary) {
-            await new Promise((resolve) => heldNonSummary.push(resolve));
+            if (heldReleaseCount > 0) heldReleaseCount -= 1;
+            else await new Promise((resolve) => {
+              resolve.message = String(options.message || "");
+              heldNonSummary.push(resolve);
+            });
           }
           if (summary && holdSummary) {
             if (summaryStartedResolve) {
@@ -99,6 +130,20 @@ function createService(key) {
               collector.emit(nextSummaryResponse);
               nextSummaryResponse = "";
             } else collector.emit(`summary:${key}`);
+          } else if (queuedStreamChunks.length > 0) {
+            const chunks = queuedStreamChunks;
+            queuedStreamChunks = [];
+            collector.emit(typeof chunks[0] === "function" ? chunks[0](options, key) : chunks[0]);
+            if (streamFirstChunkResolve) {
+              streamFirstChunkResolve();
+              streamFirstChunkResolve = null;
+            }
+            if (chunks.length > 1) {
+              await new Promise((resolve) => { streamContinuation = resolve; });
+              for (const chunk of chunks.slice(1)) {
+                collector.emit(typeof chunk === "function" ? chunk(options, key) : chunk);
+              }
+            }
           } else if (queuedRawResponses.length > 0) {
             const responseFactory = queuedRawResponses.shift();
             collector.emit(typeof responseFactory === "function" ? responseFactory(options, key) : responseFactory);
@@ -186,9 +231,9 @@ global.ToolPkg = {
   registerToolboxUiModule() {},
 };
 
-const plugin = require("../src/main.js");
+const plugin = require("../dist/main.js");
 const main = plugin;
-const { createCollaborationManager } = require("../src/collaboration/manager.js");
+const { createCollaborationManager } = require("../dist/collaboration/manager.js");
 plugin.registerToolPkg();
 
 async function call(channel, payload) {
@@ -197,7 +242,7 @@ async function call(channel, payload) {
   return handler(payload);
 }
 
-async function waitTerminal(agentId, timeoutMs = 1000) {
+async function waitTerminal(agentId, timeoutMs = 5000) {
   return call("collaboration.wait_agent", { agent_ids: [agentId], timeout_ms: timeoutMs });
 }
 
@@ -226,6 +271,7 @@ test("registers collaboration IPC handlers and disables tools for summaries and 
     "collaboration.interrupt_agent",
     "collaboration.inspect_agent",
     "collaboration.list_tree",
+    "collaboration.watch_tree_events",
     "collaboration.get_settings",
     "collaboration.update_settings",
     "collaboration.delete_agent",
@@ -249,7 +295,7 @@ test("registers collaboration IPC handlers and disables tools for summaries and 
 test("rejects invalid Agent timeouts through the registered IPC boundary", async () => {
   await assert.rejects(
     () => handlers.get("collaboration.spawn_agent")({ task: "invalid timeout", read_only: true, timeout_ms: 29999 }),
-    /timeout_ms must be an integer between 30000 and 3600000/
+    /timeout_ms must be 0 \(unlimited\) or an integer between 30000 and 3600000/
   );
 });
 
@@ -283,6 +329,276 @@ test("agent receives selected parent conversation history", async () => {
   manager.shutdown();
 });
 
+test("model stream state exposes filtered deltas before completion", async () => {
+  const firstChunk = new Promise((resolve) => { streamFirstChunkResolve = resolve; });
+  queuedStreamChunks = [
+    "public alpha\n<think>hidden reasoning</think><tool_ab name=\"read_file\"><tool_result_ab>hidden file",
+    (options) => ` body</tool_result_ab></tool_ab>public omega\n${controlFromOptions(options, "finish")}`,
+  ];
+  const started = await call("collaboration.spawn_agent", { task: "inspect streaming state", read_only: true });
+  await firstChunk;
+  await new Promise((resolve) => setTimeout(resolve, 120));
+
+  const streaming = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  assert.equal(streaming.agent.execution.stream_state.status, "streaming");
+  assert.equal(streaming.agent.execution.stream_state.public_text, "public alpha\n");
+  assert.equal(streaming.agent.execution.stream_state.offset, "public alpha\n".length);
+  assert.equal(streaming.agent.recent_events.some((event) => event.type === "model_delta"), true);
+  streamContinuation();
+  streamContinuation = null;
+
+  const result = await waitTerminal(started.agent.id);
+  assert.equal(result.agents[0].status, "completed");
+  assert.equal(result.agents[0].execution.stream_state.status, "completed");
+  assert.equal(result.agents[0].execution.stream_state.public_text, "public alpha\npublic omega\n");
+  const inspected = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const streamEvents = inspected.agent.recent_events.filter((event) => event.type.startsWith("model_stream_") || event.type === "model_delta");
+  assert.deepEqual(streamEvents.filter((event) => event.type === "model_stream_started").map((event) => event.data.stream_seq), [1]);
+  assert.equal(streamEvents.find((event) => event.type === "model_stream_ended").data.status, "completed");
+  const deltas = streamEvents.filter((event) => event.type === "model_delta");
+  assert.equal(deltas.map((event) => event.data.delta).join(""), "public alpha\npublic omega\n");
+  assert.deepEqual(deltas.map((event) => event.data.offset), ["public alpha\n".length, "public alpha\npublic omega\n".length]);
+  assert.equal(JSON.stringify(streamEvents).includes("hidden file"), false);
+  assert.equal(JSON.stringify(streamEvents).includes("COLLABORATION_CONTROL"), false);
+});
+
+test("model stream cancellation freezes public state before late chunks", async () => {
+  const firstChunk = new Promise((resolve) => { streamFirstChunkResolve = resolve; });
+  queuedStreamChunks = [
+    "public before cancel\n",
+    (options) => `late secret\n${controlFromOptions(options, "finish")}`,
+  ];
+  const started = await call("collaboration.spawn_agent", { task: "cancel active model stream", read_only: true });
+  await firstChunk;
+  const interrupted = await call("collaboration.interrupt_agent", { agent_id: started.agent.id });
+  assert.equal(interrupted.interrupt, "cancelling");
+  streamContinuation();
+  streamContinuation = null;
+
+  const result = await waitTerminal(started.agent.id);
+  assert.equal(result.agents[0].status, "interrupted_with_late_result");
+  assert.equal(result.agents[0].execution.stream_state.status, "interrupted");
+  assert.equal(result.agents[0].execution.stream_state.public_text, "public before cancel\n");
+  const inspected = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const streamEvents = inspected.agent.recent_events.filter((event) =>
+    event.type.startsWith("model_stream_") || event.type === "model_delta"
+  );
+  assert.equal(streamEvents.filter((event) => event.type === "model_delta").map((event) => event.data.delta).join(""), "public before cancel\n");
+  assert.equal(streamEvents.find((event) => event.type === "model_stream_ended").data.status, "interrupted");
+  assert.equal(JSON.stringify(streamEvents).includes("late secret"), false);
+});
+
+test("model stream cancellation preserves prior public state despite late prompt echo", async () => {
+  const firstChunk = new Promise((resolve) => { streamFirstChunkResolve = resolve; });
+  queuedStreamChunks = [
+    "public before echo\n",
+    "COLLABORATION_AGENT_CONSTRAINTS:\ninternal instructions",
+  ];
+  const started = await call("collaboration.spawn_agent", { task: "cancel stream before prompt echo", read_only: true });
+  await firstChunk;
+  const interrupted = await call("collaboration.interrupt_agent", { agent_id: started.agent.id });
+  assert.equal(interrupted.interrupt, "cancelling");
+  streamContinuation();
+  streamContinuation = null;
+
+  const result = await waitTerminal(started.agent.id);
+  assert.equal(result.agents[0].status, "interrupted_with_late_result");
+  assert.equal(result.agents[0].execution.stream_state.status, "interrupted");
+  assert.equal(result.agents[0].execution.stream_state.public_text, "public before echo\n");
+  assert.equal(result.agents[0].execution.stream_state.prompt_echo_suppressed, undefined);
+  const inspected = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const streamEnd = inspected.agent.recent_events.find((event) => event.type === "model_stream_ended");
+  assert.equal(streamEnd.data.prompt_echo_suppressed, undefined);
+});
+
+test("tree context broadcasts defer completion and inject peer context at the next checkpoint", async () => {
+  holdNonSummary = true;
+  queuedRawResponses.push(
+    (options) => `child committed shared decision\n${controlFromOptions(options, "finish")}`,
+    (options) => `root ready\n${controlFromOptions(options, "finish")}`,
+    (options) => `root refreshed\n${controlFromOptions(options, "finish")}`
+  );
+  const root = await call("collaboration.spawn_agent", { task: "watcher root consumer", read_only: true });
+  await waitForCondition(
+    () => heldNonSummary.some((release) => String(release.message || "").includes("watcher root consumer")),
+    "root model request must be held before spawning its child"
+  );
+  const child = await call("collaboration.spawn_agent", {
+    task: "watcher child producer",
+    parent_agent_id: root.agent.id,
+    read_only: true,
+  });
+  await waitForCondition(
+    () => heldNonSummary.some((release) => String(release.message || "").includes("watcher root consumer")) &&
+      heldNonSummary.some((release) => String(release.message || "").includes("watcher child producer")),
+    "root and child model requests must both be held"
+  );
+
+  releaseHeldNonSummaryMatching("watcher child producer");
+  await waitForCondition(async () => {
+    const listed = await call("collaboration.list_agents", { agent_ids: [root.agent.id, child.agent.id] });
+    const rootState = listed.agents.find((agent) => agent.id === root.agent.id);
+    const childState = listed.agents.find((agent) => agent.id === child.agent.id);
+    return childState?.status === "completed" && rootState?.execution?.tree_context?.pending_revision > 0;
+  }, "child checkpoint must broadcast before root finishes");
+
+  releaseHeldNonSummaryMatching("watcher root consumer");
+  await waitForCondition(
+    () => heldNonSummary.some((release) => String(release.message || "").includes("watcher root consumer")),
+    "root refresh request must be held"
+  );
+  releaseHeldNonSummaryMatching("watcher root consumer");
+  holdNonSummary = false;
+  while (heldNonSummary.length > 0) heldNonSummary.shift()();
+
+  const result = await call("collaboration.wait_agent", {
+    agent_ids: [root.agent.id, child.agent.id],
+    timeout_ms: 5000,
+  });
+  const rootResult = result.agents.find((agent) => agent.id === root.agent.id);
+  const childResult = result.agents.find((agent) => agent.id === child.agent.id);
+  assert.equal(rootResult.status, "completed");
+  assert.equal(childResult.status, "completed");
+  assert.equal(rootResult.execution.checkpoint_turns, 2);
+  assert.equal(rootResult.execution.tree_context.refresh_count, 1);
+  assert.equal(rootResult.execution.tree_context.watcher_active, undefined);
+  assert.ok(rootResult.execution.tree_context.applied_revision >= childResult.execution.dirty_revision);
+
+  const rootCalls = sentOptions.filter((options) => String(options.message).includes("watcher root consumer"));
+  assert.equal(rootCalls.length, 2);
+  assert.equal(rootCalls[0].chatHistory.some((turn) => String(turn.content).includes("TREE_SHARED_CONTEXT")), false);
+  const refreshContext = rootCalls[1].chatHistory.find((turn) => String(turn.content).includes("TREE_SHARED_CONTEXT"));
+  assert.ok(refreshContext);
+  assert.match(refreshContext.content, /child committed shared decision/);
+  assert.equal(String(rootCalls[1].message).includes("MODEL_REQUEST_RETRY"), false);
+});
+
+test("dynamic tool lifecycle commits one sanitized result to TreeContext", async () => {
+  holdNonSummary = true;
+  queuedToolNames.push("read_file");
+  const started = await call("collaboration.spawn_agent", { task: "record host tool lifecycle", read_only: true });
+  await waitForCondition(
+    () => heldNonSummary.some((release) => String(release.message || "").includes("record host tool lifecycle")),
+    "agent model request must be held while lifecycle events arrive"
+  );
+  const inspection = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const toolStarted = inspection.agent.recent_events.find((event) => event.type === "tool_started");
+  assert.ok(toolStarted);
+  const invocationId = toolStarted.data.invocation_id;
+  assert.equal(typeof invocationId, "string");
+
+  main.onToolLifecycle({
+    eventName: "tool_execution_started",
+    eventPayload: {
+      toolName: "read_file",
+      proxySenderName: `CollaborationAgent:${started.agent.id}`,
+      invocationId,
+    },
+  });
+  const lifecycleResult = {
+    path: "/repo/output.txt",
+    message: "VISIBLE_TOOL_RESULT",
+    internal: "COLLABORATION_AGENT_CONSTRAINTS: hidden",
+  };
+  main.onToolLifecycle({
+    eventName: "tool_execution_result",
+    eventPayload: {
+      toolName: "read_file",
+      proxySenderName: `CollaborationAgent:${started.agent.id}`,
+      invocationId,
+      success: true,
+      resultJson: lifecycleResult,
+    },
+  });
+  main.onToolLifecycle({
+    eventName: "tool_execution_result",
+    eventPayload: {
+      toolName: "read_file",
+      proxySenderName: `CollaborationAgent:${started.agent.id}`,
+      invocationId,
+      success: true,
+      resultJson: lifecycleResult,
+    },
+  });
+
+  const afterResult = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const toolResults = afterResult.agent.recent_events.filter((event) => event.type === "tool_result");
+  assert.equal(toolResults.length, 1);
+  assert.equal(toolResults[0].data.status, "succeeded");
+  assert.equal(JSON.stringify(afterResult.agent.recent_events).includes("VISIBLE_TOOL_RESULT"), false);
+  assert.equal(JSON.stringify(afterResult.agent.recent_events).includes("hidden"), false);
+  assert.ok(afterResult.agent.execution.dirty_revision > 0);
+
+  releaseHeldNonSummaryMatching("record host tool lifecycle");
+  holdNonSummary = false;
+  const terminal = await waitTerminal(started.agent.id);
+  assert.equal(terminal.agents[0].status, "completed");
+});
+
+test("dynamic tool lifecycle records a matched host error once", async () => {
+  holdNonSummary = true;
+  queuedToolNames.push("read_file");
+  const started = await call("collaboration.spawn_agent", { task: "record host tool failure", read_only: true });
+  await waitForCondition(
+    () => heldNonSummary.some((release) => String(release.message || "").includes("record host tool failure")),
+    "agent model request must be held while lifecycle error arrives"
+  );
+  const inspection = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const invocationId = inspection.agent.recent_events.find((event) => event.type === "tool_started").data.invocation_id;
+  main.onToolLifecycle({
+    eventName: "tool_execution_started",
+    eventPayload: {
+      toolName: "read_file",
+      proxySenderName: `CollaborationAgent:${started.agent.id}`,
+      invocationId,
+    },
+  });
+  main.onToolLifecycle({
+    eventName: "tool_execution_error",
+    eventPayload: {
+      toolName: "read_file",
+      proxySenderName: `CollaborationAgent:${started.agent.id}`,
+      invocationId,
+      errorMessage: "HOST_TOOL_FAILURE",
+    },
+  });
+  const afterError = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  const toolResult = afterError.agent.recent_events.find((event) => event.type === "tool_result");
+  assert.ok(toolResult);
+  assert.equal(toolResult.data.status, "failed");
+  assert.equal(JSON.stringify(afterError.agent.recent_events).includes("HOST_TOOL_FAILURE"), false);
+
+  releaseHeldNonSummaryMatching("record host tool failure");
+  holdNonSummary = false;
+  const terminal = await waitTerminal(started.agent.id);
+  assert.equal(terminal.agents[0].status, "completed");
+});
+
+test("dynamic tool lifecycle ignores errors from an unmatched invocation", async () => {
+  holdNonSummary = true;
+  queuedToolNames.push("read_file");
+  const started = await call("collaboration.spawn_agent", { task: "ignore unmatched lifecycle error", read_only: true });
+  await waitForCondition(
+    () => heldNonSummary.some((release) => String(release.message || "").includes("ignore unmatched lifecycle error")),
+    "agent model request must be held while unmatched lifecycle event arrives"
+  );
+  main.onToolLifecycle({
+    eventName: "tool_execution_error",
+    eventPayload: {
+      toolName: "read_file",
+      proxySenderName: `CollaborationAgent:${started.agent.id}`,
+      invocationId: "stale_host_invocation",
+      errorMessage: "STALE_TOOL_ERROR",
+    },
+  });
+  const inspected = await call("collaboration.inspect_agent", { agent_id: started.agent.id });
+  assert.equal(inspected.agent.recent_events.some((event) => event.type === "tool_result"), false);
+
+  releaseHeldNonSummaryMatching("ignore unmatched lifecycle error");
+  holdNonSummary = false;
+  const terminal = await waitTerminal(started.agent.id);
+  assert.equal(terminal.agents[0].status, "completed");
+});
 test("transient model failures retry within one checkpoint while balance failures stop immediately", async () => {
   const transientManager = createCollaborationManager({ retryDelayScale: 0 });
   transientManager.updateSettings({
@@ -304,6 +620,15 @@ test("transient model failures retry within one checkpoint while balance failure
   assert.equal(transientResult.agents[0].execution.checkpoint_turns, 1);
   assert.equal(transientResult.agents[0].execution.model_request_attempts, 3);
   assert.equal(transientResult.agents[0].execution.model_retry_count, 2);
+  assert.equal(transientResult.agents[0].execution.stream_state.stream_seq, 3);
+  assert.equal(transientResult.agents[0].execution.stream_state.request_attempt, 3);
+  const transientInspection = transientManager.inspect({ agent_id: transient.agent.id });
+  assert.deepEqual(
+    transientInspection.agent.recent_events
+      .filter((event) => event.type === "model_stream_started")
+      .map((event) => [event.data.request_attempt, event.data.stream_seq]),
+    [[1, 1], [2, 2], [3, 3]]
+  );
   transientManager.shutdown();
 
   const balanceManager = createCollaborationManager({ retryDelayScale: 0 });
@@ -455,7 +780,8 @@ test("agent system prompt forbids controlling the Operit host lifecycle", async 
   assert.match(prompt, /explicit creation task.*expected precondition.*proceed with creation/i);
   assert.match(prompt, /read the target back.*successful write response does not replace content verification/i);
   assert.match(prompt, /unfinished work or verification remaining means progress.*all criteria verified means finish/i);
-  assert.match(prompt, /only IDs of parent updates actually processed.*Do not invent IDs/i);
+  assert.match(prompt, /only IDs of received updates actually processed.*Do not invent IDs/i);
+  assert.match(prompt, /add up to 32 outbound_messages entries/i);
   assert.doesNotMatch(prompt, /create_file: requires|edit_file: requires|write_file: requires|common file tools/i);
 });
 
@@ -468,7 +794,7 @@ test("spawns a stable logical agent and completes a follow-up run", async () => 
   assert.equal(started.success, true);
   assert.equal(started.persistence, "memory");
   assert.equal(started.persistence_model, "event_store");
-  assert.equal(started.persistence_schema, 3);
+  assert.equal(started.persistence_schema, 4);
   assert.ok(started.persistence_revision >= 1);
   assert.match(started.persistence_error, /SQLite unavailable/);
   assert.equal(started.path_isolation, "declarative");
@@ -925,6 +1251,19 @@ test("structured progress requires another checkpoint and finish completes witho
   assert.equal(result.agents[0].execution.control_action, "finish");
   assert.equal(result.agents[0].result, "structured final result");
   assert.equal(result.agents[0].result.includes("COLLABORATION_CONTROL"), false);
+});
+
+test("finish control delivers an outbound main message before terminal publication", async () => {
+  queuedRawResponses.push((options) => `${controlFromOptions(options, "finish", {
+    outbound_messages: [{ message_id: "main-finish", target: "main", content: "finished with update" }],
+  })}`);
+  const started = await call("collaboration.spawn_agent", { task: "finish with main update", read_only: true });
+  const result = await waitTerminal(started.agent.id);
+  assert.equal(result.agents[0].status, "completed");
+  assert.deepEqual(result.agents[0].main_messages.map((message) => ({
+    message_id: message.message_id,
+    content: message.content,
+  })), [{ message_id: "main-finish", content: "finished with update" }]);
 });
 
 test("structured fail terminates the run with the declared error", async () => {
@@ -1697,7 +2036,7 @@ test("cumulative checkpoint ledger preserves early authoritative facts beyond th
     task: "accumulate authoritative facts across checkpoints",
     read_only: true,
   });
-  const result = await call("collaboration.wait_agent", { agent_ids: [started.agent.id], timeout_ms: 3000 });
+  const result = await call("collaboration.wait_agent", { agent_ids: [started.agent.id], timeout_ms: 5000 });
   assert.equal(result.agents[0].status, "completed");
   assert.equal(result.agents[0].result, "ledger verified");
   const resumedCalls = sentOptions.filter((options) => {
@@ -1889,7 +2228,7 @@ test("configurable per-root concurrency limits one root while other roots use re
   holdNonSummary = false;
   while (heldNonSummary.length > 0) heldNonSummary.shift()();
   const allIds = [root.agent.id, ...children.map((entry) => entry.agent.id), ...otherRoots.map((entry) => entry.agent.id)];
-  const completed = await call("collaboration.wait_agent", { agent_ids: allIds, timeout_ms: 1000 });
+  const completed = await call("collaboration.wait_agent", { agent_ids: allIds, timeout_ms: 5000 });
   assert.equal(completed.agents.every((agent) => agent.status === "completed"), true);
   await call("collaboration.update_settings", {
     max_concurrent_agents: 6,

@@ -1,8 +1,7 @@
-"use strict";
-
-const {
+import {
   SUPPRESSED_PROMPT_ECHO_RESULT,
   cleanAgentResult,
+  createPublicStreamFilter,
   extractToolReceipts,
   hasFinalTextAfterTool,
   looksLikePromptEcho,
@@ -13,7 +12,85 @@ const {
   stripControlEnvelopes,
   stripMessageAcks,
   stripTransportControls,
-} = require("./helpers.js");
+  type CollaborationControl,
+  type JsonRecord,
+  type OutboundControlMessage,
+  type ToolReceipt,
+} from "./helpers.js";
+import type {
+  CollaborationAgent,
+  CollaborationCheckpoint,
+  CollaborationExecution,
+  CollaborationMessage,
+} from "./model.js";
+
+type DynamicRecord = Record<string, unknown>;
+type RuntimeActionGate = {
+  kind: string;
+  pendingMetadata: string[];
+  allowedTools: string[];
+  mutationCheckpointIndex?: number;
+  failedAttempts?: number;
+  unknownOutcome?: boolean;
+};
+type SummaryQueueEntry = {
+  task: () => unknown | Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (reason?: unknown) => void;
+};
+type StreamCollector = { emit(value: unknown): unknown };
+type SuspendStream = { callSuspend(method: string, collector: StreamCollector): unknown };
+type PromptHistoryTurn = { kind?: unknown; content?: unknown };
+type MetadataParameter = { name?: unknown; required?: unknown };
+type MetadataTool = { name?: unknown; parameters?: unknown; description?: unknown };
+type MetadataDocument = { name?: unknown; description?: unknown; tools?: unknown };
+type MetadataToolContract = {
+  name: string;
+  required: string[];
+  optional: string[];
+  description: string;
+};
+type MetadataContract = {
+  package: string;
+  description: string;
+  tools: MetadataToolContract[];
+};
+type StepEvidence = {
+  version: number;
+  authoritative_metadata: Array<MetadataContract & { source_tool: string }>;
+  mutation_receipts: Array<{ tool: string; status: string }>;
+};
+type PendingMutationCheckpoint = {
+  checkpoint: CollaborationCheckpoint;
+  index: number;
+  failedAttempts: number;
+  unknownOutcome: boolean;
+};
+type ModelRetryContext = {
+  request_attempt?: number;
+  prior_attempt_failed?: boolean;
+  tool_outcome_unknown?: boolean;
+};
+type ModelStepCallbacks = {
+  serviceKeySuffix?: string;
+  retryContext?: ModelRetryContext | null;
+  finalizationHandoff?: string;
+  getSharedContext?: () => PromptHistoryTurn[];
+  onAccepted?: () => void;
+  onStreamStart?: () => void;
+  onStreamDelta?: (delta: string) => void;
+  onStreamEnd?: (status: "completed" | "interrupted", promptEchoSuppressed: boolean) => void;
+  onToolInvocation: (toolName: string) => void;
+  onSummaryStarted?: () => void;
+  onSummaryFinished?: () => void;
+};
+type RepairedControl = Omit<CollaborationControl, "outboundMessages"> & {
+  outboundMessages?: OutboundControlMessage[];
+};
+
+function asRecord(value: unknown): DynamicRecord {
+  return value !== null && typeof value === "object" ? value as DynamicRecord : {};
+}
 
 const EnhancedAIService = Java.com.ai.assistance.operit.api.chat.EnhancedAIService;
 const FunctionType = Java.com.ai.assistance.operit.data.model.FunctionType;
@@ -119,12 +196,13 @@ const ACTION_GATE_METADATA_ALLOWED_TOOL_NAMES = new Set([
 ]);
 const ACTION_GATE_PENDING_MUTATION_ALLOWED_TOOL_NAMES = new Set(["edit_file"]);
 const ACTION_GATE_MUTATION_TOOL_NAMES = new Set(["edit_file"]);
-const summaryQueue = [];
+const summaryQueue: SummaryQueueEntry[] = [];
 let activeSummaries = 0;
 
-function pumpSummaryQueue() {
+function pumpSummaryQueue(): void {
   while (activeSummaries < MAX_SUMMARY_CONCURRENCY && summaryQueue.length > 0) {
     const entry = summaryQueue.shift();
+    if (!entry) break;
     activeSummaries += 1;
     Promise.resolve()
       .then(entry.task)
@@ -136,48 +214,75 @@ function pumpSummaryQueue() {
   }
 }
 
-function withSummarySlot(task) {
-  return new Promise((resolve, reject) => {
-    summaryQueue.push({ task, resolve, reject });
+function withSummarySlot<T>(task: () => T | Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    summaryQueue.push({
+      task,
+      resolve: (value: unknown) => resolve(value as T),
+      reject,
+    });
     pumpSummaryQueue();
   });
 }
 
-function promptKind(kind) {
-  return PromptTurnKindClass[kind] || PromptTurnKindClass.USER;
+function promptKind(kind: unknown): unknown {
+  return PromptTurnKindClass[String(kind || "")] || PromptTurnKindClass.USER;
 }
 
-function toPromptTurns(history) {
+function toPromptTurns(history: PromptHistoryTurn[] | null | undefined): unknown[] {
   return (history || []).map(
-    (turn) => new PromptTurnClass(promptKind(turn.kind), String(turn.content || ""), null, {})
+    (turn: PromptHistoryTurn) => new PromptTurnClass(promptKind(turn.kind), String(turn.content || ""), null, {})
   );
 }
 
-async function collectStream(stream, idleTimeoutMs, message) {
+async function collectStream(
+  stream: SuspendStream,
+  idleTimeoutMs: number,
+  message: string,
+  callbacks: {
+    onStart?: () => void;
+    onDelta?: (delta: string) => void;
+    onEnd?: (status: "completed" | "interrupted", promptEchoSuppressed: boolean) => void;
+  } = {},
+): Promise<string> {
   let buffer = "";
-  let timeoutId = null;
+  let timeoutId: unknown = null;
   let settled = false;
-  return new Promise((resolve, reject) => {
+  const publicFilter = createPublicStreamFilter();
+  return new Promise<string>((resolve, reject) => {
     const clearIdleTimeout = () => {
       if (timeoutId !== null) clearTimeout(timeoutId);
       timeoutId = null;
     };
+    const finishPublicStream = (status: "completed" | "interrupted") => {
+      if (status === "completed") {
+        const finalDelta = publicFilter.finish();
+        if (finalDelta && callbacks.onDelta) callbacks.onDelta(finalDelta);
+      }
+      if (callbacks.onEnd) callbacks.onEnd(status, publicFilter.promptEchoSuppressed);
+    };
     const armIdleTimeout = () => {
       clearIdleTimeout();
+      if (idleTimeoutMs === 0) return;
       timeoutId = setTimeout(() => {
         if (settled) return;
         settled = true;
+        finishPublicStream("interrupted");
         reject(new Error(message));
       }, idleTimeoutMs);
     };
-    const collector = {
-      emit(value) {
+    const collector: StreamCollector = {
+      emit(value: unknown) {
         if (settled) return Unit.INSTANCE;
-        buffer += String(value || "");
+        const chunk = String(value || "");
+        buffer += chunk;
+        const delta = publicFilter.push(chunk);
+        if (delta && callbacks.onDelta) callbacks.onDelta(delta);
         armIdleTimeout();
         return Unit.INSTANCE;
       },
     };
+    if (callbacks.onStart) callbacks.onStart();
     armIdleTimeout();
     let collection;
     try {
@@ -185,6 +290,7 @@ async function collectStream(stream, idleTimeoutMs, message) {
     } catch (error) {
       settled = true;
       clearIdleTimeout();
+      finishPublicStream("interrupted");
       reject(error);
       return;
     }
@@ -193,19 +299,21 @@ async function collectStream(stream, idleTimeoutMs, message) {
         if (settled) return;
         settled = true;
         clearIdleTimeout();
+        finishPublicStream("completed");
         resolve(buffer);
       },
       (error) => {
         if (settled) return;
         settled = true;
         clearIdleTimeout();
+        finishPublicStream("interrupted");
         reject(error);
       }
     );
   });
 }
 
-function buildSystemPrompt(agent, execution) {
+function buildSystemPrompt(agent: CollaborationAgent, execution: CollaborationExecution): string {
   const base = String(SystemPromptConfig.SUBTASK_AGENT_PROMPT_TEMPLATE || "").trim();
   const pendingExplicitCreation = hasPendingExplicitCreation(agent, execution);
   const actionGate = activeActionGate(agent, execution);
@@ -237,7 +345,9 @@ function buildSystemPrompt(agent, execution) {
     execution.continuationRequired === true
       ? "- This no-tool finalization checkpoint is a decision gate, not a blocker. Assess the earlier committed checkpoint reports and do not call tools in this checkpoint. If any required action or verification remains, return progress; progress reopens tools. Return fail only for a genuine blocker that another tool checkpoint cannot resolve."
       : "",
-    `- Keep tool calls focused; planning target maximum: ${execution.maxToolCalls}. This budget is not a reason to defer a required action, repeat discovery, or stop before the delegated task is complete.`,
+    execution.maxToolCalls === 0
+      ? "- Keep tool calls focused. The planning tool-call budget is unlimited; continue until the delegated task and required verification are complete."
+      : `- Keep tool calls focused; planning target maximum: ${execution.maxToolCalls}. This budget is not a reason to defer a required action, repeat discovery, or stop before the delegated task is complete.`,
     execution.continuationRequired === true
       ? ""
       : "- You have access to all available tools. Before calling ANY tool, carefully read its full description and parameter schema from the tool definitions in your context.",
@@ -283,43 +393,48 @@ function buildSystemPrompt(agent, execution) {
     "- Finish with a concise report covering changes/findings, validation, and risks.",
     "- Before choosing the control action, check every completion criterion: unfinished work or verification remaining means progress; all criteria verified means finish; a genuine unrecoverable blocker means fail with a non-empty error.",
     "- End every raw response with one transport control line and no text after it:",
-    `  COLLABORATION_CONTROL: {\"version\":1,\"execution_epoch\":${JSON.stringify(execution.epoch)},\"action\":\"finish\",\"message_acks\":[],\"error\":\"\"}`,
-    "- Put only IDs of parent updates actually processed and incorporated into message_acks. Do not invent IDs or acknowledge merely observed updates; use an empty array when there is nothing to acknowledge. The control line is internal and must not be discussed.",
+    `  COLLABORATION_CONTROL: {\"version\":1,\"execution_epoch\":${JSON.stringify(execution.epoch)},\"action\":\"finish\",\"message_acks\":[],\"outbound_messages\":[],\"error\":\"\"}`,
+    "- Put only IDs of received updates actually processed and incorporated into message_acks. Do not invent IDs or acknowledge merely observed updates; use an empty array when there is nothing to acknowledge. The control line is internal and must not be discussed.",
+    "- To coordinate without tools, add up to 32 outbound_messages entries. Each entry is {message_id,target,agent_id?,content}; message_id uses 1-128 printable ASCII characters and content uses 1-16384 characters. target is main, parent, root, or agent. Use a stable message_id within this execution. agent_id is required only for target=agent. Do not declare a sender; the runtime binds it. Routing is restricted to the current task tree.",
   ].filter(Boolean).join("\n");
 }
 
-function compactDescription(value, limit = 320) {
+function compactDescription(value: unknown, limit: number = 320): string {
+  const record = asRecord(value);
   const source = value && typeof value === "object"
-    ? (value.en || value.zh || Object.values(value)[0])
+    ? (record.en || record.zh || Object.values(record)[0])
     : value;
   const text = String(source || "").replace(/\s+/g, " ").trim();
   if (!text) return "";
   return text.length > limit ? `${text.slice(0, limit - 3)}...` : text;
 }
 
-function parseAuthoritativeMetadataContracts(value) {
+function parseAuthoritativeMetadataContracts(value: unknown): MetadataContract[] {
   const normalized = String(value || "").replace(/^[ \t]*\d+\|[ \t]?/gm, "");
-  const contracts = [];
+  const contracts: MetadataContract[] = [];
   const metadataBlock = /\/\*\s*METADATA\s*([\s\S]*?)\*\//gi;
-  let match;
+  let match: RegExpExecArray | null;
   while ((match = metadataBlock.exec(normalized)) !== null) {
-    let metadata;
+    let metadata: MetadataDocument;
     try {
-      metadata = JSON.parse(match[1].trim());
+      metadata = asRecord(JSON.parse(match[1].trim())) as MetadataDocument;
     } catch (_) {
       continue;
     }
-    if (!metadata || typeof metadata !== "object" || !Array.isArray(metadata.tools)) continue;
+    if (!Array.isArray(metadata.tools)) continue;
     const packageName = String(metadata.name || "").trim();
     if (!packageName) continue;
-    const tools = [];
-    for (const tool of metadata.tools) {
-      const name = String(tool?.name || "").trim();
+    const tools: MetadataToolContract[] = [];
+    for (const toolValue of metadata.tools) {
+      const tool = asRecord(toolValue) as MetadataTool;
+      const name = String(tool.name || "").trim();
       if (!name) continue;
-      const required = [];
-      const optional = [];
-      for (const parameter of Array.isArray(tool.parameters) ? tool.parameters : []) {
-        const parameterName = String(parameter?.name || "").trim();
+      const required: string[] = [];
+      const optional: string[] = [];
+      const parameters = Array.isArray(tool.parameters) ? tool.parameters : [];
+      for (const parameterValue of parameters) {
+        const parameter = asRecord(parameterValue) as MetadataParameter;
+        const parameterName = String(parameter.name || "").trim();
         if (!parameterName) continue;
         (parameter.required === true ? required : optional).push(parameterName);
       }
@@ -338,13 +453,13 @@ function parseAuthoritativeMetadataContracts(value) {
       });
     }
   }
-  const unique = new Map();
+  const unique = new Map<string, MetadataContract>();
   for (const contract of contracts) unique.set(contract.package, contract);
   return [...unique.values()];
 }
 
-function formatAuthoritativeMetadataContracts(contracts) {
-  return (contracts || []).map((contract) => {
+function formatAuthoritativeMetadataContracts(contracts: MetadataContract[]): string {
+  return (contracts || []).map((contract: MetadataContract) => {
     const lines = [`AUTHORITATIVE_METADATA_CONTRACT package=${contract.package}`];
     if (contract.description) lines.push(`package_description: ${contract.description}`);
     for (const tool of contract.tools || []) {
@@ -360,16 +475,14 @@ function formatAuthoritativeMetadataContracts(contracts) {
   }).join("\n");
 }
 
-function classifyEditFileResult(receipt) {
+function classifyEditFileResult(receipt: ToolReceipt): string {
   if (!receipt?.hasResult) return "unknown";
   const text = String(receipt.result || "").trim();
   if (!text) return "unknown";
   try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object") {
-      if (parsed.success === true) return "succeeded";
-      if (parsed.success === false || parsed.error) return "failed";
-    }
+    const parsed = asRecord(JSON.parse(text));
+    if (parsed.success === true) return "succeeded";
+    if (parsed.success === false || parsed.error) return "failed";
   } catch (_) {}
   if (/(?:Successfully applied AI code to file|Successfully (?:edited|updated|modified)\b|(?:编辑|修改|替换)(?:已)?成功|成功(?:编辑|修改|替换))/i.test(text)) {
     return "succeeded";
@@ -380,18 +493,20 @@ function classifyEditFileResult(receipt) {
   return "unknown";
 }
 
-function buildStepEvidence(raw, invokedToolNames) {
+function buildStepEvidence(raw: unknown, invokedToolNames: string[]): StepEvidence {
   const invoked = (invokedToolNames || [])
-    .map((name) => String(name || "").trim())
+    .map((name: string) => String(name || "").trim())
     .filter(Boolean);
-  const authoritativeMetadata = [];
-  const mutationReceipts = [];
+  const authoritativeMetadata: Array<MetadataContract & { source_tool: string }> = [];
+  const mutationReceipts: Array<{ tool: string; status: string }> = [];
   for (const receipt of extractToolReceipts(raw)) {
     const fullName = String(receipt.name || "").trim();
-    const normalizedName = fullName.split(":").at(-1);
-    const matchedInvocation = invoked.some((invokedName) => {
+    const fullNameParts = fullName.split(":");
+    const normalizedName = fullNameParts[fullNameParts.length - 1];
+    const matchedInvocation = invoked.some((invokedName: string) => {
       if (invokedName === fullName) return true;
-      const invokedShortName = invokedName.split(":").at(-1);
+      const invokedNameParts = invokedName.split(":");
+      const invokedShortName = invokedNameParts[invokedNameParts.length - 1];
       return (!invokedName.includes(":") || !fullName.includes(":")) && invokedShortName === normalizedName;
     });
     if (!matchedInvocation) continue;
@@ -407,7 +522,7 @@ function buildStepEvidence(raw, invokedToolNames) {
       });
     }
   }
-  const uniqueMetadata = new Map();
+  const uniqueMetadata = new Map<string, MetadataContract & { source_tool: string }>();
   for (const contract of authoritativeMetadata) uniqueMetadata.set(contract.package, contract);
   return {
     version: 1,
@@ -416,20 +531,24 @@ function buildStepEvidence(raw, invokedToolNames) {
   };
 }
 
-function compactCheckpointLedgerResult(value, limit = 600) {
+function compactCheckpointLedgerResult(value: unknown, limit: number = 600): string {
   const text = safePublicResult(value).replace(/\s+/g, " ").trim();
   if (!text) return "no safe report";
   const effectiveLimit = text.includes("AUTHORITATIVE_METADATA_CONTRACT") ? 4000 : limit;
   return text.length > effectiveLimit ? `${text.slice(0, effectiveLimit - 3)}...` : text;
 }
 
-function finalizationHandoff(raw, toolNames) {
+function finalizationHandoff(raw: unknown, toolNames: string[]): string {
   const receipts = extractToolReceipts(raw);
-  const invoked = new Set((toolNames || []).map((name) => String(name || "").split(":").at(-1)).filter(Boolean));
-  const sections = [];
+  const invoked = new Set<string>((toolNames || []).map((name: string) => {
+    const parts = String(name || "").split(":");
+    return parts[parts.length - 1];
+  }).filter(Boolean));
+  const sections: string[] = [];
   for (const receipt of receipts) {
     const toolName = String(receipt.name || "");
-    const normalized = toolName.split(":").at(-1);
+    const toolNameParts = toolName.split(":");
+    const normalized = toolNameParts[toolNameParts.length - 1];
     if (!receipt.hasResult || !invoked.has(normalized)) continue;
     const result = String(receipt.result || "").trim();
     if (!result) continue;
@@ -438,20 +557,25 @@ function finalizationHandoff(raw, toolNames) {
   return sections.join("\n\n");
 }
 
-function checkpointToolNames(checkpoint) {
-  return Array.isArray(checkpoint?.diagnostics?.tool_names)
-    ? checkpoint.diagnostics.tool_names.filter(Boolean).join(", ")
+function checkpointToolNames(checkpoint: CollaborationCheckpoint): string {
+  const diagnostics = asRecord(checkpoint.diagnostics);
+  return Array.isArray(diagnostics.tool_names)
+    ? diagnostics.tool_names.filter(Boolean).join(", ")
     : "";
 }
 
-function taskAuthoritativeMetadataPackages(execution, targetPaths = []) {
+function taskAuthoritativeMetadataPackages(
+  execution: CollaborationExecution,
+  targetPaths: string[] = [],
+): string[] {
   const task = `${execution.task || ""}\n${execution.context || ""}`;
   if (!/(?:METADATA|authoritative\s+(?:source|schema|contract)|权威\s*(?:源|契约|模式))/i.test(task)) return [];
-  const targetPackages = new Set((targetPaths || []).map((targetPath) => {
-    const fileName = String(targetPath || "").replace(/\\/g, "/").split("/").at(-1) || "";
+  const targetPackages = new Set<string>((targetPaths || []).map((targetPath: string) => {
+    const pathParts = String(targetPath || "").replace(/\\/g, "/").split("/");
+    const fileName = pathParts[pathParts.length - 1] || "";
     return fileName.replace(/\.js$/i, "");
   }).filter(Boolean));
-  const packages = new Set();
+  const packages = new Set<string>();
   for (const match of task.matchAll(/(?:^|[\\/])([A-Za-z0-9_.-]+)\.js\b/gi)) {
     const packageName = String(match[1] || "").trim();
     if (packageName && !targetPackages.has(packageName)) packages.add(packageName);
@@ -459,25 +583,30 @@ function taskAuthoritativeMetadataPackages(execution, targetPaths = []) {
   return [...packages];
 }
 
-function checkpointReports(execution) {
+function checkpointReports(execution: CollaborationExecution): string[] {
   return (execution.checkpoints || [])
-    .map((checkpoint) => safePublicResult(checkpoint.result))
+    .map((checkpoint: CollaborationCheckpoint) => safePublicResult(checkpoint.result))
     .filter(Boolean);
 }
 
-function pendingAuthoritativeMetadataPackages(execution, targetPaths = []) {
+function pendingAuthoritativeMetadataPackages(
+  execution: CollaborationExecution,
+  targetPaths: string[] = [],
+): string[] {
   const declared = taskAuthoritativeMetadataPackages(execution, targetPaths);
   if (declared.length === 0) return [];
-  const structuredPackages = new Set();
-  const legacyReports = [];
+  const structuredPackages = new Set<string>();
+  const legacyReports: string[] = [];
   for (const checkpoint of execution.checkpoints || []) {
-    if (checkpoint?.evidence?.version === 1) {
-      for (const contract of checkpoint.evidence.authoritative_metadata || []) {
-        const packageName = String(contract?.package || "").trim();
+    const evidence = asRecord(checkpoint.evidence);
+    if (evidence.version === 1 && Array.isArray(evidence.authoritative_metadata)) {
+      for (const contractValue of evidence.authoritative_metadata) {
+        const contract = asRecord(contractValue);
+        const packageName = String(contract.package || "").trim();
         if (packageName) structuredPackages.add(packageName);
       }
     } else {
-      legacyReports.push(safePublicResult(checkpoint?.result));
+      legacyReports.push(safePublicResult(checkpoint.result));
     }
   }
   const legacyText = legacyReports.filter(Boolean).join("\n");
@@ -488,38 +617,48 @@ function pendingAuthoritativeMetadataPackages(execution, targetPaths = []) {
   });
 }
 
-function mutationReportClauses(report) {
+function mutationReportClauses(report: unknown): string[] {
   return String(report || "")
     .split(/[\r\n。！？；;，,]+|[.!?]+(?=\s|$)/)
-    .map((clause) => clause.trim())
+    .map((clause: string) => clause.trim())
     .filter(Boolean);
 }
 
-function reportRequiresPendingMutation(report) {
-  const concreteScope = /(?:\b(?:exact|specific|scoped|unique|uniquely|ambiguous|multiple|mismatch|replacement|section|block|line|parameter|schema)\b|\b[A-Za-z0-9_.-]+\.(?:md|txt|js|json|ts|tsx|jsx|py|java|kt|xml|ya?ml|toml)\b|\b[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[^\s,;，；]+|具体|精确|唯一|歧义|多处|整段|区块|行号|参数|契约|不匹配)/i.test(report);
+function reportRequiresPendingMutation(report: unknown): boolean {
+  const reportText = String(report || "");
+  const concreteScope = /(?:\b(?:exact|specific|scoped|unique|uniquely|ambiguous|multiple|mismatch|replacement|section|block|line|parameter|schema)\b|\b[A-Za-z0-9_.-]+\.(?:md|txt|js|json|ts|tsx|jsx|py|java|kt|xml|ya?ml|toml)\b|\b[A-Za-z_][A-Za-z0-9_.-]*\s*=\s*[^\s,;，；]+|具体|精确|唯一|歧义|多处|整段|区块|行号|参数|契约|不匹配)/i.test(reportText);
   if (!concreteScope) return false;
-  return mutationReportClauses(report).some((clause) => {
+  return mutationReportClauses(reportText).some((clause: string) => {
     const requiresMutation = /(?:\b(?:next|required|remaining)\s+action\b[^\r\n]{0,120}\b(?:edit(?:_file)?|patch|replace(?:ment)?|correct(?:ion)?|fix)\b|\b(?:must|needs?\s+to|still\s+needs?\s+to|remain(?:s)?\s+to)\b[^\r\n]{0,100}\b(?:edit(?:_file)?|patch|replace(?:ment)?|correct(?:ion)?|fix)\b|\b(?:edit(?:_file)?|patch|replace(?:ment)?|correct(?:ion)?|fix)\b[^\r\n]{0,100}\b(?:required|pending|remains?)\b|(?:下一|下个|所需|待执行|仍需|尚未(?:执行|完成))[^\r\n]{0,40}(?:编辑|修正|替换|补丁|修改)|(?:编辑|修正|替换|补丁|修改)[^\r\n]{0,40}(?:待执行|仍需|尚未(?:执行|完成)|必需|是下一动作))/i.test(clause);
     const unresolved = !/(?:\b(?:edit|patch|replacement|correction|fix)\b[^\r\n]{0,80}\b(?:completed|succeeded|verified)\b|\b(?:completed|succeeded|verified)\b[^\r\n]{0,80}\b(?:edit|patch|replacement|correction|fix)\b|(?:编辑|修正|替换|补丁|修改)[^\r\n]{0,40}(?:已完成|成功|已验证)|(?:已完成|已成功|已验证)(?:(?:了|该|此|本次|精确|具体|所需|上述)\s*){0,4}(?:编辑|修正|替换|补丁|修改)|(?:已|已经)(?:(?:将|把|由|完成|成功|验证|精确|具体|本次|上述|所需)\s*){1,4}(?:(?!尚未(?:执行|完成)|下一|下个|待执行|仍需|必需|必须|需要)[^\r\n]){0,60}(?:编辑|修正|替换|补丁|修改))/i.test(clause);
     return requiresMutation && unresolved;
   });
 }
 
-function latestPendingMutationCheckpoint(execution) {
+function latestPendingMutationCheckpoint(
+  execution: CollaborationExecution,
+): PendingMutationCheckpoint | null {
   const checkpoints = execution.checkpoints || [];
-  let candidate = null;
+  let candidate: PendingMutationCheckpoint | null = null;
   for (let index = 0; index < checkpoints.length; index += 1) {
     const checkpoint = checkpoints[index];
-    const tools = new Set(Array.isArray(checkpoint?.diagnostics?.tool_names)
-      ? checkpoint.diagnostics.tool_names.filter(Boolean).map((name) => String(name).split(":").at(-1))
+    const diagnostics = asRecord(checkpoint.diagnostics);
+    const tools = new Set<string>(Array.isArray(diagnostics.tool_names)
+      ? diagnostics.tool_names.filter(Boolean).map((name: unknown) => {
+          const parts = String(name).split(":");
+          return parts[parts.length - 1];
+        })
       : []);
     const report = safePublicResult(checkpoint.result);
-    const mutationInvoked = [...tools].some((toolName) => ACTION_GATE_MUTATION_TOOL_NAMES.has(toolName));
+    const mutationInvoked = [...tools].some((toolName: string) => ACTION_GATE_MUTATION_TOOL_NAMES.has(toolName));
     if (mutationInvoked) {
-      if (checkpoint?.evidence?.version === 1) {
-        const receipts = (checkpoint.evidence.mutation_receipts || [])
-          .filter((receipt) => ACTION_GATE_MUTATION_TOOL_NAMES.has(receipt?.tool));
-        const status = String(receipts.at(-1)?.status || "unknown");
+      const evidence = asRecord(checkpoint.evidence);
+      if (evidence.version === 1 && Array.isArray(evidence.mutation_receipts)) {
+        const receipts = evidence.mutation_receipts
+          .map((receipt: unknown) => asRecord(receipt))
+          .filter((receipt: DynamicRecord) => ACTION_GATE_MUTATION_TOOL_NAMES.has(String(receipt.tool || "")));
+        const latestReceipt = receipts[receipts.length - 1];
+        const status = String(latestReceipt?.status || "unknown");
         if (status === "succeeded") {
           candidate = null;
           continue;
@@ -543,7 +682,10 @@ function latestPendingMutationCheckpoint(execution) {
   return candidate;
 }
 
-function activeActionGate(agent, execution) {
+function activeActionGate(
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+): RuntimeActionGate | null {
   if (execution.retryVerificationPending === true) {
     return {
       kind: "model_retry_verification",
@@ -577,35 +719,44 @@ function activeActionGate(agent, execution) {
   return null;
 }
 
-function actionGateToolAllowed(actionGate, toolName) {
+function actionGateToolAllowed(actionGate: RuntimeActionGate | null, toolName: unknown): boolean {
   if (!actionGate) return true;
-  const normalized = String(toolName || "").trim().split(":").at(-1);
+  const toolNameParts = String(toolName || "").trim().split(":");
+  const normalized = toolNameParts[toolNameParts.length - 1];
   return actionGate.allowedTools.includes(normalized);
 }
 
-function actionGateForAgent(agent, execution) {
+function actionGateForAgent(
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+): RuntimeActionGate | null {
   return activeActionGate(agent, execution);
 }
 
-function clearModelRetryVerification(execution) {
+function clearModelRetryVerification(execution: CollaborationExecution): void {
   execution.retryVerificationPending = false;
   execution.modelRetryToolOutcomeUnknown = false;
 }
 
-function latestAssignedOutputState(execution) {
+function latestAssignedOutputState(execution: CollaborationExecution): "created" | "pending" | "unknown" {
   const reports = execution.checkpoints
-    .map((checkpoint) => safePublicResult(checkpoint.result))
+    .map((checkpoint: CollaborationCheckpoint) => safePublicResult(checkpoint.result))
     .join("\n");
-  const pendingMatches = Array.from(reports.matchAll(/(?:\b(?:file|output|template)\b[^\r\n]{0,80}\b(?:has not been|hasn't been|not yet|still needs to be|still needs|needs to be|must be)\s+(?:created|written|generated)\b|\b(?:create|write|generate)\b[^\r\n]{0,80}\b(?:the\s+)?(?:assigned\s+)?(?:file|output|template)\b|\bcreation\b[^\r\n]{0,40}\b(?:pending|required|remains)\b|(?:文件|输出|模板)[^\r\n]{0,40}(?:尚未|还未|未曾)(?:创建|写入|生成)|(?:仍需|需要|待)(?:创建|写入|生成))/gi));
-  const createdMatches = Array.from(reports.matchAll(/(?:\b(?:file|output|template)\b[^\r\n]{0,80}\b(?:(?:was|has been|is|successfully)\s+)?(?:created|written|generated)\b|\b(?:created|wrote|generated)\b[^\r\n]{0,80}\b(?:file|output|template)\b|(?:文件|输出|模板)[^\r\n]{0,40}(?:已创建|已写入|已生成|创建成功|写入成功|生成成功)|(?:已创建|已写入|已生成)[^\r\n]{0,40}(?:文件|输出|模板))/gi));
-  const pendingIndex = pendingMatches.length > 0 ? pendingMatches.at(-1).index : -1;
-  const createdIndex = createdMatches.length > 0 ? createdMatches.at(-1).index : -1;
+  const pendingMatches: RegExpMatchArray[] = Array.from(reports.matchAll(/(?:\b(?:file|output|template)\b[^\r\n]{0,80}\b(?:has not been|hasn't been|not yet|still needs to be|still needs|needs to be|must be)\s+(?:created|written|generated)\b|\b(?:create|write|generate)\b[^\r\n]{0,80}\b(?:the\s+)?(?:assigned\s+)?(?:file|output|template)\b|\bcreation\b[^\r\n]{0,40}\b(?:pending|required|remains)\b|(?:文件|输出|模板)[^\r\n]{0,40}(?:尚未|还未|未曾)(?:创建|写入|生成)|(?:仍需|需要|待)(?:创建|写入|生成))/gi));
+  const createdMatches: RegExpMatchArray[] = Array.from(reports.matchAll(/(?:\b(?:file|output|template)\b[^\r\n]{0,80}\b(?:(?:was|has been|is|successfully)\s+)?(?:created|written|generated)\b|\b(?:created|wrote|generated)\b[^\r\n]{0,80}\b(?:file|output|template)\b|(?:文件|输出|模板)[^\r\n]{0,40}(?:已创建|已写入|已生成|创建成功|写入成功|生成成功)|(?:已创建|已写入|已生成)[^\r\n]{0,40}(?:文件|输出|模板))/gi));
+  const pendingMatch = pendingMatches[pendingMatches.length - 1];
+  const createdMatch = createdMatches[createdMatches.length - 1];
+  const pendingIndex = pendingMatches.length > 0 ? (pendingMatch?.index ?? -1) : -1;
+  const createdIndex = createdMatches.length > 0 ? (createdMatch?.index ?? -1) : -1;
   if (createdIndex > pendingIndex) return "created";
   if (pendingIndex >= 0) return "pending";
   return "unknown";
 }
 
-function hasPendingExplicitCreation(agent, execution) {
+function hasPendingExplicitCreation(
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+): boolean {
   if (agent.readOnly || agent.targetPaths.length === 0) return false;
   const task = `${execution.task || ""}\n${execution.context || ""}`;
   if (!/(?:\bcreate\b|\bgenerate\b|\bwrite\b[^\r\n]{0,40}\bfile\b|创建|生成)/i.test(task)) return false;
@@ -613,8 +764,13 @@ function hasPendingExplicitCreation(agent, execution) {
   return latestAssignedOutputState(execution) === "pending";
 }
 
-function buildTaskMessage(agent, execution, deliveredMessages, finalizationHandoffText = "") {
-  const lines = [];
+function buildTaskMessage(
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+  deliveredMessages: CollaborationMessage[],
+  finalizationHandoffText: string = "",
+): string {
+  const lines: string[] = [];
   const pendingExplicitCreation = hasPendingExplicitCreation(agent, execution);
   const actionGate = activeActionGate(agent, execution);
   if (execution.continuationRequired === true) {
@@ -652,11 +808,14 @@ function buildTaskMessage(agent, execution, deliveredMessages, finalizationHando
     );
   }
   if (deliveredMessages.length > 0) {
-    lines.push("IMPORTANT PARENT UPDATE — process before the original task:");
-    for (const message of deliveredMessages) lines.push(`[${message.id}] ${message.content}`);
+    lines.push("IMPORTANT COLLABORATION UPDATE — process before the original task:");
+    for (const message of deliveredMessages) {
+      const source = String(message.sourceAgentId || "").trim();
+      lines.push(`[${message.id}]${source ? ` From Agent ${source}:` : ""} ${message.content}`);
+    }
     lines.push(
       "This update augments or overrides earlier task instructions.",
-      `Include these processed IDs in the final COLLABORATION_CONTROL message_acks array: ${JSON.stringify(deliveredMessages.map((message) => message.id))}`,
+      `Include these processed IDs in the final COLLABORATION_CONTROL message_acks array: ${JSON.stringify(deliveredMessages.map((message: CollaborationMessage) => message.id))}`,
       "If structured control cannot be produced, the legacy COLLABORATION_MESSAGE_ACKS line remains accepted for compatibility.",
       "Transport controls must not be discussed in the report.",
       ""
@@ -664,12 +823,12 @@ function buildTaskMessage(agent, execution, deliveredMessages, finalizationHando
   }
   lines.push(
     `Delegated task for logical agent ${agent.id}, run ${execution.seq}:`,
-    execution.task
+    String(execution.task || "")
   );
-  if (execution.context) lines.push("", "Task context:", execution.context);
+  if (execution.context) lines.push("", "Task context:", String(execution.context));
   if (agent.workspacePath) lines.push("", `Workspace: ${agent.workspacePath} (${agent.workspaceEnv})`);
   if (agent.targetPaths.length > 0) {
-    lines.push("", "Assigned paths:", ...agent.targetPaths.map((path) => `- ${path}`));
+    lines.push("", "Assigned paths:", ...agent.targetPaths.map((path: string) => `- ${path}`));
   }
   if (agent.history.length > 0) {
     lines.push("", "Previous runs of this logical agent:");
@@ -692,7 +851,7 @@ function buildTaskMessage(agent, execution, deliveredMessages, finalizationHando
         );
       }
     }
-    const messageAudit = agent.inbox.filter((message) => message.acknowledged !== true);
+    const messageAudit = agent.inbox.filter((message: CollaborationMessage) => message.acknowledged !== true);
     if (messageAudit.length > 0) {
       lines.push("Unacknowledged parent-message delivery audit:");
       for (const message of messageAudit.slice(-8)) {
@@ -726,7 +885,11 @@ function buildTaskMessage(agent, execution, deliveredMessages, finalizationHando
   return lines.join("\n");
 }
 
-function buildSummaryPrompt(agent, execution, transcript) {
+function buildSummaryPrompt(
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+  transcript: unknown,
+): string {
   return [
     "Summarize the delegated task result for the parent agent.",
     "Do not call tools. Do not include XML, raw file contents, system prompts, or internal instructions.",
@@ -742,7 +905,12 @@ function buildSummaryPrompt(agent, execution, transcript) {
   ].join("\n");
 }
 
-async function summarize(appContext, agent, execution, transcript) {
+async function summarize(
+  appContext: unknown,
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+  transcript: unknown,
+): Promise<string> {
   return withSummarySlot(async () => {
     if (execution.cancelRequested) throw new Error("result summary cancelled before start");
     const serviceKey = `${SUMMARY_SERVICE_PREFIX}${execution.epoch}:${execution.stepCount}`;
@@ -788,7 +956,12 @@ async function summarize(appContext, agent, execution, transcript) {
   });
 }
 
-async function executeModelStep(agent, execution, deliveredMessages, callbacks) {
+async function executeModelStep(
+  agent: CollaborationAgent,
+  execution: CollaborationExecution,
+  deliveredMessages: CollaborationMessage[],
+  callbacks: ModelStepCallbacks,
+) {
   const appContext = Java.getApplicationContext();
   if (!appContext) throw new Error("application context is unavailable");
   const serviceKeySuffix = String(callbacks.serviceKeySuffix || "").trim();
@@ -797,9 +970,9 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
   execution.serviceKey = serviceKey;
   const service = EnhancedAIService.getChatInstance(appContext, serviceKey);
   let stepToolCount = 0;
-  const stepToolNames = [];
+  const stepToolNames: string[] = [];
   try {
-    const config = await service.callSuspend("getModelConfigForFunction", FunctionType.CHAT, null, null);
+    const config = asRecord(await service.callSuspend("getModelConfigForFunction", FunctionType.CHAT, null, null));
     const contextLength = Number(config.contextLength);
     const threshold = Number(config.summaryTokenThreshold);
     const options = new SendMessageOptionsClass();
@@ -820,7 +993,9 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
     options.chatId = finalizationCheckpoint
       ? `${FINALIZATION_CHAT_PREFIX}${agent.id}`
       : `${AGENT_CHAT_PREFIX}${agent.id}`;
-    options.chatHistory = toPromptTurns(execution.conversationContext || []);
+    options.chatHistory = toPromptTurns(
+      typeof callbacks.getSharedContext === "function" ? callbacks.getSharedContext() : []
+    );
     options.workspacePath = agent.workspacePath || null;
     options.workspaceEnv = agent.workspaceEnv || null;
     options.functionType = FunctionType.CHAT;
@@ -833,7 +1008,7 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
     options.notifyReplyOverride = false;
     options.disableWarning = true;
     options.callbacks = {
-      onToolInvocation(toolName) {
+      onToolInvocation(toolName: unknown) {
         stepToolCount += 1;
         const normalizedToolName = String(toolName || "");
         if (normalizedToolName && !stepToolNames.includes(normalizedToolName)) stepToolNames.push(normalizedToolName);
@@ -846,15 +1021,24 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
     const raw = await collectStream(
       stream,
       execution.timeoutMs,
-      `agent stream idle for ${execution.timeoutMs} ms`
+      `agent stream idle for ${execution.timeoutMs} ms`,
+      {
+        onStart: callbacks.onStreamStart,
+        onDelta: callbacks.onStreamDelta,
+        onEnd: callbacks.onStreamEnd,
+      }
     );
     const evidence = buildStepEvidence(raw, stepToolNames);
     const parsedControl = parseControlEnvelope(raw);
     const legacyAcknowledgedIds = parseMessageAcks(raw);
-    const controlEpochMatches = parsedControl.valid && parsedControl.control &&
-      parsedControl.control.executionEpoch === execution.epoch;
+    const receivedControl = parsedControl.valid ? parsedControl.control : null;
+    const controlEpochMatches = receivedControl !== null &&
+      receivedControl.executionEpoch === execution.epoch;
     const structuredAcknowledgedIds = controlEpochMatches
-      ? parsedControl.control.messageAcks
+      ? receivedControl.messageAcks
+      : [];
+    const outboundMessages = controlEpochMatches
+      ? receivedControl.outboundMessages
       : [];
     const acknowledgedMessageIds = parsedControl.valid && parsedControl.control && !controlEpochMatches
       ? []
@@ -877,12 +1061,12 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
     const needsSummary = !cleaned || promptEchoDetected || (continuationRequired && !finalizationCheckpoint);
     const summaryRepairRequired = needsSummary &&
       (!parsedControl.valid || parsedControl.control?.action === "finish");
-    let result = deterministicFallback;
+    let result: unknown = deterministicFallback;
     let summaryError = "";
     let summaryStatus = needsSummary ? "pending" : "not_required";
     let summaryFallbackUsed = false;
     let resultSuppressed = false;
-    let repairedControl = null;
+    let repairedControl: RepairedControl | null = null;
     if (needsSummary) {
       if (callbacks.onSummaryStarted) callbacks.onSummaryStarted();
       try {
@@ -984,6 +1168,7 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
         finalization_checkpoint: finalizationCheckpoint,
       },
       acknowledgedMessageIds,
+      outboundMessages,
       controlPresent: parsedControl.present,
       controlValid: !!effectiveControl,
       control: effectiveControl,
@@ -999,14 +1184,14 @@ async function executeModelStep(agent, execution, deliveredMessages, callbacks) 
   }
 }
 
-function cancelService(serviceKey) {
+function cancelService(serviceKey: unknown): void {
   if (!serviceKey) return;
   try {
     EnhancedAIService.releaseChatInstance(serviceKey);
   } catch (_) {}
 }
 
-module.exports = {
+export {
   SUMMARY_CHAT_PREFIX,
   AGENT_CHAT_PREFIX,
   FINALIZATION_CHAT_PREFIX,

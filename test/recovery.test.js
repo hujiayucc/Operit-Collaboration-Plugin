@@ -250,7 +250,7 @@ global.Java = {
   },
 };
 
-const { createCollaborationStore } = require("../src/collaboration/store.js");
+const { createCollaborationStore } = require("../dist/collaboration/store.js");
 const setupStore = createCollaborationStore();
 const preparedEffect = setupStore.prepareEffect({
   execution_epoch: "agent_effect_running:1:1",
@@ -261,7 +261,7 @@ const preparedEffect = setupStore.prepareEffect({
 setupStore.resolveEffect(preparedEffect.effect.effectKey, "unknown", { reason: "test restart" });
 setupStore.close();
 
-const { createCollaborationManager } = require("../src/collaboration/manager.js");
+const { createCollaborationManager } = require("../dist/collaboration/manager.js");
 
 test("recovery starts a new attempt for safe read-only runs, blocks unresolved effects, resolves cancellation, and requeues queued runs", async () => {
   const manager = createCollaborationManager();

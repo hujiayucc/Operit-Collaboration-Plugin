@@ -31,7 +31,7 @@ global.ToolPkg = {
   registerAppLifecycleHook() { lifecycleRegistered = true; },
 };
 
-const main = require("../src/main.js");
+const main = require("../dist/main.js");
 
 test("missing toolbox UI capability degrades without blocking core registration", () => {
   assert.equal(main.registerToolPkg(), true);

@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 
-const entryPath = path.resolve(__dirname, "../src/ui/collaboration_dashboard/index.ui.js");
+const entryPath = path.resolve(__dirname, "../dist/ui/collaboration_dashboard/index.ui.js");
 const entryModule = require(entryPath);
 const Screen = entryModule.default || entryModule.Screen;
 
@@ -160,6 +160,17 @@ test("status filter renders all options as buttons and refreshes on selection", 
     ].includes(node.props.text)
   );
   assert.equal(optionButtons.length, 11, "all status options must be directly visible");
+  const timedOutButton = optionButtons.find((node) => node.props.text === "Timed out");
+  const orphanedButton = optionButtons.find((node) => node.props.text === "Orphaned");
+  const timedOutRow = flattenNodes(tree).find(
+    (node) => node.type === "Row" && node.children.includes(timedOutButton)
+  );
+  assert.ok(timedOutRow && timedOutRow.children.includes(orphanedButton), "Timed out and Orphaned must share a row");
+  const clearHistory = flattenNodes(tree).find(
+    (node) => node.type === "Button" && node.props.text === "Clear history"
+  );
+  assert.equal(clearHistory.props.fillMaxWidth, true, "Clear history must occupy its own row");
+  assert.equal(clearHistory.props.weight, undefined);
   const runningOption = optionButtons.find((node) => node.props.text === "Running");
   await runningOption.props.onClick();
 
@@ -557,7 +568,6 @@ test("structured task results render readable fields instead of raw JSON", () =>
   try {
     const ctx = createContext("zh-CN");
     ctx.__state.set("dashboard.view", "detail");
-    ctx.__state.set("dashboard.showResult", true);
     ctx.__state.set("dashboard.selectedAgent", {
       id: "agent_result_json",
       name: "结果测试",
@@ -578,6 +588,9 @@ test("structured task results render readable fields instead of raw JSON", () =>
 
     const nodes = flattenNodes(Screen(ctx));
     const texts = nodes.filter((node) => node.type === "Text").map((node) => node.props.text);
+    const buttons = nodes.filter((node) => node.type === "Button").map((node) => node.props.text);
+    assert.equal(buttons.includes("显示结果"), false);
+    assert.equal(buttons.includes("隐藏结果"), false);
     assert.ok(texts.includes("执行成功"));
     assert.ok(texts.includes("成功:"));
     assert.ok(texts.includes("是"));
@@ -601,7 +614,6 @@ test("JSON code blocks are parsed while plain text results remain readable text"
   try {
     const jsonCtx = createContext("en-US");
     jsonCtx.__state.set("dashboard.view", "detail");
-    jsonCtx.__state.set("dashboard.showResult", true);
     jsonCtx.__state.set("dashboard.selectedAgent", {
       id: "agent_fenced_json",
       name: "Fenced result",
@@ -623,7 +635,6 @@ test("JSON code blocks are parsed while plain text results remain readable text"
 
     const textCtx = createContext("en-US");
     textCtx.__state.set("dashboard.view", "detail");
-    textCtx.__state.set("dashboard.showResult", true);
     textCtx.__state.set("dashboard.selectedAgent", {
       id: "agent_plain_result",
       name: "Plain result",
@@ -652,7 +663,6 @@ test("Markdown task results render native headings, lists, quotes, links and cod
   try {
     const ctx = createContext("en-US");
     ctx.__state.set("dashboard.view", "detail");
-    ctx.__state.set("dashboard.showResult", true);
     ctx.__state.set("dashboard.selectedAgent", {
       id: "agent_markdown_result",
       name: "Markdown result",
@@ -737,7 +747,6 @@ test("recent events render localized readable cards instead of raw JSON", () => 
   try {
     const ctx = createContext("zh-CN");
     ctx.__state.set("dashboard.view", "detail");
-    ctx.__state.set("dashboard.showResult", true);
     ctx.__state.set("dashboard.selectedAgent", {
       id: "agent_events",
       name: "事件测试",
@@ -788,7 +797,6 @@ test("unknown recent event types fall back to readable labels", () => {
   try {
     const ctx = createContext("en-US");
     ctx.__state.set("dashboard.view", "detail");
-    ctx.__state.set("dashboard.showResult", true);
     ctx.__state.set("dashboard.selectedAgent", {
       id: "agent_unknown_event",
       name: "Unknown event",
@@ -876,7 +884,6 @@ test("English dashboard shows action-gate state, counters, and lifecycle events"
   try {
     const ctx = createContext("en-US");
     ctx.__state.set("dashboard.view", "detail");
-    ctx.__state.set("dashboard.showResult", true);
     ctx.__state.set("dashboard.selectedAgent", {
       id: "agent_gate_observability",
       name: "Gate observability",
@@ -942,10 +949,10 @@ test("global settings control updates scheduler settings from the dashboard home
     ].includes(node.props.label)
   );
   assert.equal(inputs.length, 4, "global settings inputs must be on the dashboard home");
-  inputs.find((input) => input.props.label === "Global maximum concurrent Agents").props.onValueChange("16");
-  inputs.find((input) => input.props.label === "Per-root task-tree concurrency").props.onValueChange("8");
-  inputs.find((input) => input.props.label === "Global tool calls").props.onValueChange("64");
-  inputs.find((input) => input.props.label === "AI call retries").props.onValueChange("12");
+  inputs.find((input) => input.props.label === "Global maximum concurrent Agents").props.onValueChange("0");
+  inputs.find((input) => input.props.label === "Per-root task-tree concurrency").props.onValueChange("0");
+  inputs.find((input) => input.props.label === "Global tool calls").props.onValueChange("0");
+  inputs.find((input) => input.props.label === "AI call retries").props.onValueChange("-1");
   tree = Screen(ctx);
   const contextButtons = flattenNodes(tree).filter(
     (node) => node.type === "Button" && ["Off", "On", "✓ Auto"].includes(node.props.text)
@@ -962,10 +969,10 @@ test("global settings control updates scheduler settings from the dashboard home
 
   const update = calls.find((call) => call.channel === "collaboration.update_settings");
   assert.deepEqual(update.payload, {
-    max_concurrent_agents: 16,
-    max_active_runs_per_root: 8,
-    max_tool_calls: 64,
-    max_model_retries: 12,
+    max_concurrent_agents: 0,
+    max_active_runs_per_root: 0,
+    max_tool_calls: 0,
+    max_model_retries: -1,
     conversation_context_mode: "on",
   });
   global.ToolPkg = original;
@@ -974,21 +981,47 @@ test("global settings control updates scheduler settings from the dashboard home
 test("create form creates one Agent and uses global settings implicitly", async () => {
   const calls = [];
   const original = global.ToolPkg;
+  let resolveWatch;
+  const watchResult = new Promise((resolve) => {
+    resolveWatch = resolve;
+  });
   global.ToolPkg = {
     ipc: {
       async call(channel, payload, options) {
         calls.push({ channel, payload, options });
         if (channel === "collaboration.spawn_agent") {
-          return { success: true, agent: { id: `agent_${calls.length}` } };
+          return { success: true, agent: { id: "agent_created" } };
         }
-        return {
-          success: true,
-          active: 0,
-          queued: 0,
-          total: 3,
-          has_more: false,
-          agents: [],
-        };
+        if (channel === "collaboration.list_agents") {
+          return {
+            success: true,
+            active: 1,
+            queued: 0,
+            total: 1,
+            has_more: false,
+            agents: [{ id: "agent_created", name: "Reviewer", status: "running" }],
+          };
+        }
+        if (channel === "collaboration.inspect_agent") {
+          return {
+            success: true,
+            agent: {
+              id: "agent_created",
+              name: "Reviewer",
+              status: "running",
+              run_seq: 1,
+              read_only: true,
+              priority: "normal",
+              target_paths: [],
+              execution: {},
+            },
+          };
+        }
+        if (channel === "collaboration.list_tree") {
+          return { success: true, root_run_id: "root_created", nodes: [] };
+        }
+        if (channel === "collaboration.watch_tree_events") return watchResult;
+        return { success: true };
       },
     },
   };
@@ -1013,7 +1046,8 @@ test("create form creates one Agent and uses global settings implicitly", async 
     (node) => node.type === "Button" && node.props.text === "Submit"
   );
   assert.ok(submit, "create form must expose Submit");
-  await submit.props.onClick();
+  const submitPromise = submit.props.onClick();
+  await new Promise((resolve) => setImmediate(resolve));
 
   const spawnCalls = calls.filter((call) => call.channel === "collaboration.spawn_agent");
   assert.equal(spawnCalls.length, 1);
@@ -1022,7 +1056,109 @@ test("create form creates one Agent and uses global settings implicitly", async 
   assert.equal(typeof spawnCalls[0].payload.request_id, "string");
   assert.ok(calls.some((call) => call.channel === "collaboration.list_agents"));
   assert.equal(ctx.__state.get("dashboard.view"), "detail");
+  assert.equal(ctx.__state.get("dashboard.mutationLoading"), false);
+  resolveWatch({ success: true });
+  await submitPromise;
   global.ToolPkg = original;
+});
+
+test("follow-up submit keeps the Compose action alive through detail refresh", async () => {
+  const original = global.ToolPkg;
+  const calls = [];
+  let resolveFollowup;
+  let actionSettled = false;
+  const followupResult = new Promise((resolve) => {
+    resolveFollowup = resolve;
+  });
+  global.ToolPkg = {
+    ipc: {
+      async call(channel, payload, options) {
+        calls.push({ channel, payload, options, actionSettled });
+        if (channel === "collaboration.followup_task") return followupResult;
+        if (channel === "collaboration.list_agents") {
+          return {
+            success: true,
+            active: 1,
+            queued: 0,
+            total: 1,
+            has_more: false,
+            agents: [{ id: "agent_follow", name: "Follow", status: "running" }],
+          };
+        }
+        if (channel === "collaboration.inspect_agent") {
+          return {
+            success: true,
+            agent: {
+              id: "agent_follow",
+              name: "Follow",
+              status: "running",
+              run_seq: 2,
+              read_only: true,
+              priority: "normal",
+              target_paths: [],
+              execution: {},
+            },
+          };
+        }
+        if (channel === "collaboration.list_tree") {
+          return { success: true, root_run_id: "root_follow", nodes: [] };
+        }
+        if (channel === "collaboration.watch_tree_events") {
+          return {
+            success: true,
+            revision: 0,
+            next_revision: 0,
+            events: [],
+            shutdown: true,
+          };
+        }
+        return { success: true };
+      },
+    },
+  };
+  try {
+    const ctx = createContext("en-US");
+    ctx.__state.set("dashboard.view", "followup");
+    ctx.__state.set("dashboard.follow.task", "Continue the verified work");
+    ctx.__state.set("dashboard.follow.mode", "readonly");
+    ctx.__state.set("dashboard.selectedAgent", {
+      id: "agent_follow",
+      name: "Follow",
+      status: "completed",
+      run_seq: 1,
+      read_only: true,
+      priority: "normal",
+      target_paths: [],
+      execution: {},
+    });
+
+    const tree = Screen(ctx);
+    const submit = flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Submit"
+    );
+    assert.ok(submit, "follow-up form must expose Submit");
+    const actionPromise = submit.props.onClick();
+    assert.equal(typeof actionPromise?.then, "function", "follow-up handler must return its full action Promise");
+    actionPromise.finally(() => { actionSettled = true; });
+    assert.deepEqual(calls.map((call) => call.channel), ["collaboration.followup_task"]);
+
+    resolveFollowup({ success: true, agent: { id: "agent_follow" } });
+    await actionPromise;
+
+    assert.deepEqual(calls.map((call) => call.channel), [
+      "collaboration.followup_task",
+      "collaboration.list_agents",
+      "collaboration.inspect_agent",
+      "collaboration.list_tree",
+      "collaboration.watch_tree_events",
+    ]);
+    assert.ok(calls.every((call) => call.actionSettled === false),
+      "all post-follow-up refresh calls must run before the Compose action session settles");
+    assert.equal(ctx.__state.get("dashboard.error"), "");
+    assert.equal(ctx.__state.get("dashboard.view"), "detail");
+  } finally {
+    global.ToolPkg = original;
+  }
 });
 
 test("dashboard onLoad automatically loads Agents on every page mount", async () => {
@@ -1057,9 +1193,421 @@ test("dashboard onLoad automatically loads Agents on every page mount", async ()
   assert.equal(calls.filter((call) => call.channel === "collaboration.list_agents").length, 2,
     "each page mount must reload the Agent list");
   const firstList = calls.find((call) => call.channel === "collaboration.list_agents");
-  assert.deepEqual(firstList.options, { targetRuntime: "main" });
+  assert.equal(firstList.options, undefined);
   assert.equal(ctx.__state.get("dashboard.agents")[0].id, "agent_auto");
   global.ToolPkg = original;
+});
+
+test("detail action keeps one IPC closure through initial load, watch and snapshot refresh", async () => {
+  const original = global.ToolPkg;
+  let resolveInitialInspect;
+  let resolveFirstWatch;
+  let resolveSecondWatch;
+  let inspectCalls = 0;
+  let watchCalls = 0;
+  const initialInspect = new Promise((resolve) => {
+    resolveInitialInspect = resolve;
+  });
+  const firstWatch = new Promise((resolve) => {
+    resolveFirstWatch = resolve;
+  });
+  const secondWatch = new Promise((resolve) => {
+    resolveSecondWatch = resolve;
+  });
+  const originatingCalls = [];
+  global.ToolPkg = {
+    ipc: {
+      async call(channel, payload, options) {
+        originatingCalls.push({ channel, payload, options });
+        if (channel === "collaboration.inspect_agent") {
+          inspectCalls += 1;
+          if (inspectCalls === 1) return initialInspect;
+          return {
+            success: true,
+            agent: {
+              id: "agent_watch",
+              name: "Watch",
+              status: "running",
+              run_seq: 1,
+              read_only: true,
+              priority: "normal",
+              target_paths: [],
+              execution: {},
+            },
+          };
+        }
+        if (channel === "collaboration.list_tree") {
+          return { success: true, root_run_id: "root_watch", nodes: [] };
+        }
+        if (channel === "collaboration.watch_tree_events") {
+          watchCalls += 1;
+          return watchCalls === 1 ? firstWatch : secondWatch;
+        }
+        return { success: true };
+      },
+    },
+  };
+  try {
+    const ctx = createContext("en-US");
+    ctx.__state.set("dashboard.agents", [{
+      id: "agent_watch",
+      name: "Watch",
+      status: "running",
+      run_seq: 1,
+      read_only: true,
+      priority: "normal",
+      target_paths: [],
+      execution: {},
+    }]);
+    let tree = Screen(ctx);
+    const details = flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Details"
+    );
+    const openPromise = details.props.onClick();
+    assert.deepEqual(
+      originatingCalls.map((call) => call.channel),
+      ["collaboration.inspect_agent"],
+      "detail action must capture and invoke the originating IPC before its first await"
+    );
+
+    const replacementCalls = [];
+    global.ToolPkg = {
+      ipc: {
+        async call(channel) {
+          replacementCalls.push(channel);
+          throw new Error(`ToolPkg.ipc channel is not registered: ${channel}`);
+        },
+      },
+    };
+    Screen(ctx);
+
+    resolveInitialInspect({
+      success: true,
+      agent: {
+        id: "agent_watch",
+        name: "Watch",
+        status: "running",
+        run_seq: 1,
+        read_only: true,
+        priority: "normal",
+        target_paths: [],
+        execution: {},
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(watchCalls, 1);
+    assert.deepEqual(
+      originatingCalls.map((call) => call.channel),
+      [
+        "collaboration.inspect_agent",
+        "collaboration.list_tree",
+        "collaboration.watch_tree_events",
+      ]
+    );
+    assert.equal(ctx.__state.get("dashboard.detailLoading"), false);
+    assert.equal(ctx.__state.get("dashboard.view"), "detail");
+
+    resolveFirstWatch({
+      success: true,
+      events: [{
+        agent_id: "agent_watch",
+        execution_id: "root_watch",
+        type: "checkpoint",
+        created_at: 1,
+        data: {},
+      }],
+      revision: 1,
+      next_revision: 1,
+      snapshot_required: false,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(inspectCalls, 2, "event refresh must reuse the originating IPC closure");
+    assert.equal(watchCalls, 2, "watch loop must continue through the originating IPC closure");
+    assert.deepEqual(
+      originatingCalls.map((call) => call.channel),
+      [
+        "collaboration.inspect_agent",
+        "collaboration.list_tree",
+        "collaboration.watch_tree_events",
+        "collaboration.inspect_agent",
+        "collaboration.list_tree",
+        "collaboration.watch_tree_events",
+      ]
+    );
+    assert.ok(originatingCalls.every((call) => call.options === undefined));
+
+    tree = Screen(ctx);
+    const back = flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Back"
+    );
+    back.props.onClick();
+    resolveSecondWatch({ success: true, events: [], revision: 1, next_revision: 1, timed_out: true });
+    await openPromise;
+
+    assert.equal(replacementCalls.length, 0, "the replacement IPC must not run inside the originating action");
+    assert.equal(ctx.__state.get("dashboard.error") || "", "");
+  } finally {
+    global.ToolPkg = original;
+  }
+});
+
+test("ToolPkg update helpers validate archive names and build host contracts", () => {
+  assert.equal(entryModule.__test.isToolPkgArchive({ name: "release.TOOLPKG" }), true);
+  assert.equal(entryModule.__test.isToolPkgArchive({ path: "/tmp/release.toolpkg" }), true);
+  assert.equal(entryModule.__test.isToolPkgArchive({ name: "release.zip" }), false);
+
+  const payload = entryModule.__test.buildToolPkgUpdatePayload({
+    path: "/tmp/picked_1.toolpkg",
+    name: "Collaboration 1.0.3.toolpkg",
+    size: 1234,
+  }, 42);
+  assert.deepEqual(payload, {
+    source_path: "/tmp/picked_1.toolpkg",
+    source_name: "Collaboration 1.0.3.toolpkg",
+    source_size: 1234,
+    target_path: "/sdcard/Android/data/com.ai.assistance.operit/files/packages/com.operit.collaboration_orchestrator-42.toolpkg",
+  });
+  assert.deepEqual(entryModule.__test.buildToolPkgCopyParams(payload), {
+    source: "/tmp/picked_1.toolpkg",
+    destination: payload.target_path,
+    recursive: "false",
+    source_environment: "android",
+    dest_environment: "android",
+  });
+  assert.deepEqual(entryModule.__test.buildToolPkgBroadcastParams(payload), {
+    action: "com.ai.assistance.operit.DEBUG_INSTALL_TOOLPKG",
+    component: "com.ai.assistance.operit/.core.tools.packTool.ToolPkgDebugInstallReceiver",
+    extras: {
+      package_name: "com.operit.collaboration_orchestrator",
+      file_path: payload.target_path,
+      reset_subpackage_states: true,
+    },
+  });
+});
+
+test("ToolPkg update selection validates before confirmation", async () => {
+  const original = global.ToolPkg;
+  global.ToolPkg = { ipc: { async call() { return { success: true }; } } };
+  try {
+    const cases = [
+      {
+        result: { cancelled: true, files: [] },
+        toast: "Package selection cancelled",
+      },
+      {
+        result: { cancelled: false, files: [{ name: "release.zip", path: "/tmp/release.zip" }] },
+        toast: "Choose a .toolpkg archive",
+      },
+      {
+        result: { cancelled: false, files: [{ name: "release.toolpkg", uri: "content://release" }] },
+        toast: "The host did not return a package path that can be copied",
+      },
+    ];
+    for (const item of cases) {
+      const toolCalls = [];
+      const toasts = [];
+      const ctx = createContext("en-US");
+      ctx.showToast = (message) => { toasts.push(message); };
+      ctx.openFilePicker = async (options) => {
+        assert.deepEqual(options, {
+          mimeTypes: ["application/zip", "application/octet-stream", "*/*"],
+          allowMultiple: false,
+          persistPermission: false,
+        });
+        return item.result;
+      };
+      ctx.callTool = async (...args) => { toolCalls.push(args); };
+      const choose = flattenNodes(Screen(ctx)).find(
+        (node) => node.type === "Button" && node.props.text === "Choose package"
+      );
+      assert.ok(choose);
+      await choose.props.onClick();
+      assert.equal(ctx.__state.get("dashboard.view"), "list");
+      assert.equal(ctx.__state.get("dashboard.notice") || "", "");
+      assert.equal(ctx.__state.get("dashboard.error") || "", "");
+      assert.deepEqual(toasts, [item.toast]);
+      assert.equal(toolCalls.length, 0);
+    }
+  } finally {
+    global.ToolPkg = original;
+  }
+});
+
+test("ToolPkg update confirms before copying and dispatches the broadcast last", async () => {
+  const original = global.ToolPkg;
+  global.ToolPkg = { ipc: { async call() { return { success: true }; } } };
+  const toolCalls = [];
+  try {
+    const ctx = createContext("en-US");
+    ctx.openFilePicker = async () => ({
+      cancelled: false,
+      files: [{ name: "release.TOOLPKG", path: "/tmp/staged.toolpkg", size: 321 }],
+    });
+    ctx.callTool = async (name, params) => {
+      toolCalls.push({ name, params });
+      return { success: true };
+    };
+
+    let tree = Screen(ctx);
+    const choose = flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Choose package"
+    );
+    await choose.props.onClick();
+    assert.equal(toolCalls.length, 0, "selection must not create side effects before confirmation");
+    assert.equal(ctx.__state.get("dashboard.view"), "confirm");
+    assert.equal(ctx.__state.get("dashboard.confirmAction").kind, "updateToolPkg");
+    assert.match(ctx.__state.get("dashboard.confirmAction").warning, /release\.TOOLPKG \(321 B\)/);
+
+    tree = Screen(ctx);
+    const confirm = flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Confirm"
+    );
+    await confirm.props.onClick();
+    assert.deepEqual(toolCalls.map((call) => call.name), ["copy_file", "send_broadcast"]);
+    assert.equal(toolCalls[0].params.source, "/tmp/staged.toolpkg");
+    assert.equal(toolCalls[0].params.destination, toolCalls[1].params.extras.file_path);
+    assert.equal(toolCalls[1].params.extras.package_name, "com.operit.collaboration_orchestrator");
+    assert.equal(ctx.__state.get("dashboard.view"), "list");
+  } finally {
+    global.ToolPkg = original;
+  }
+});
+
+test("ToolPkg update settles after the broadcast request returns without duplicate progress", async () => {
+  const original = global.ToolPkg;
+  const toasts = [];
+  global.ToolPkg = { ipc: { async call() { return { success: true }; } } };
+  try {
+    const ctx = createContext("en-US");
+    ctx.showToast = (message) => { toasts.push(message); };
+    ctx.openFilePicker = async () => ({
+      cancelled: false,
+      files: [{ name: "release.toolpkg", path: "/tmp/staged.toolpkg" }],
+    });
+    ctx.callTool = async () => ({ success: true });
+    let tree = Screen(ctx);
+    await flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Choose package"
+    ).props.onClick();
+    tree = Screen(ctx);
+    await flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Confirm"
+    ).props.onClick();
+
+    assert.equal(ctx.__state.get("dashboard.packageUpdate.loading"), false);
+    assert.equal(ctx.__state.get("dashboard.packageUpdate.phase"), "idle");
+    assert.equal(ctx.__state.get("dashboard.notice"), "");
+    assert.deepEqual(toasts, [
+      "Update request submitted; the host will install and reload it in the background",
+    ]);
+    const settledNodes = flattenNodes(Screen(ctx));
+    assert.ok(settledNodes.some(
+      (node) => node.type === "Button" && node.props.text === "Choose package"
+    ));
+    assert.equal(settledNodes.some(
+      (node) => node.type === "Text" && node.props.text === "Copying the package…"
+    ), false);
+    assert.equal(settledNodes.filter(
+      (node) => node.type === "Text" &&
+        node.props.text === "Update request submitted; the host will install and reload it in the background"
+    ).length, 0);
+  } finally {
+    global.ToolPkg = original;
+  }
+});
+
+test("ToolPkg update stops when copying fails", async () => {
+  const original = global.ToolPkg;
+  global.ToolPkg = { ipc: { async call() { return { success: true }; } } };
+  const toolCalls = [];
+  const toasts = [];
+  try {
+    const ctx = createContext("en-US");
+    ctx.showToast = (message) => { toasts.push(message); };
+    ctx.openFilePicker = async () => ({
+      cancelled: false,
+      files: [{ name: "release.toolpkg", path: "/tmp/staged.toolpkg" }],
+    });
+    ctx.callTool = async (name, params) => {
+      toolCalls.push({ name, params });
+      if (name === "copy_file") throw new Error("copy denied");
+      return { success: true };
+    };
+    let tree = Screen(ctx);
+    await flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Choose package"
+    ).props.onClick();
+    tree = Screen(ctx);
+    await flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Confirm"
+    ).props.onClick();
+    assert.deepEqual(toolCalls.map((call) => call.name), ["copy_file"]);
+    assert.deepEqual(toasts, ["copy denied"]);
+    assert.equal(ctx.__state.get("dashboard.error") || "", "");
+    assert.equal(ctx.__state.get("dashboard.notice") || "", "");
+    assert.equal(ctx.__state.get("dashboard.packageUpdate.loading"), false);
+    assert.equal(ctx.__state.get("dashboard.packageUpdate.phase"), "idle");
+  } finally {
+    global.ToolPkg = original;
+  }
+});
+
+test("ToolPkg update reports missing host capabilities through Toast", async () => {
+  const original = global.ToolPkg;
+  global.ToolPkg = { ipc: { async call() { return { success: true }; } } };
+  try {
+    const toasts = [];
+    const ctx = createContext("en-US");
+    ctx.showToast = (message) => { toasts.push(message); };
+    const choose = flattenNodes(Screen(ctx)).find(
+      (node) => node.type === "Button" && node.props.text === "Choose package"
+    );
+    await choose.props.onClick();
+    assert.deepEqual(toasts, [
+      "This host is missing the file picker or tool-call support required for ToolPkg updates",
+    ]);
+    assert.equal(ctx.__state.get("dashboard.error") || "", "");
+    assert.equal(ctx.__state.get("dashboard.notice") || "", "");
+    assert.equal(ctx.__state.get("dashboard.view"), "list");
+  } finally {
+    global.ToolPkg = original;
+  }
+});
+
+test("ToolPkg update surfaces a broadcast failure through Toast after a successful copy", async () => {
+  const original = global.ToolPkg;
+  global.ToolPkg = { ipc: { async call() { return { success: true }; } } };
+  const toolCalls = [];
+  const toasts = [];
+  try {
+    const ctx = createContext("en-US");
+    ctx.showToast = (message) => { toasts.push(message); };
+    ctx.openFilePicker = async () => ({
+      cancelled: false,
+      files: [{ name: "release.toolpkg", path: "/tmp/staged.toolpkg" }],
+    });
+    ctx.callTool = async (name, params) => {
+      toolCalls.push({ name, params });
+      if (name === "send_broadcast") throw new Error("receiver unavailable");
+      return { success: true };
+    };
+    let tree = Screen(ctx);
+    await flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Choose package"
+    ).props.onClick();
+    tree = Screen(ctx);
+    await flattenNodes(tree).find(
+      (node) => node.type === "Button" && node.props.text === "Confirm"
+    ).props.onClick();
+    assert.deepEqual(toolCalls.map((call) => call.name), ["copy_file", "send_broadcast"]);
+    assert.deepEqual(toasts, ["receiver unavailable"]);
+    assert.equal(ctx.__state.get("dashboard.error") || "", "");
+    assert.equal(ctx.__state.get("dashboard.notice"), "");
+    assert.equal(ctx.__state.get("dashboard.packageUpdate.loading"), false);
+    assert.equal(ctx.__state.get("dashboard.packageUpdate.phase"), "idle");
+  } finally {
+    global.ToolPkg = original;
+  }
 });
 
 test("initial Agent loading retries a transient IPC startup failure", async () => {

@@ -6,9 +6,9 @@ const path = require("node:path");
 const test = require("node:test");
 
 const root = path.resolve(__dirname, "..");
-const indexSource = fs.readFileSync(path.join(root, "src/ui/collaboration_dashboard/index.ui.js"), "utf8");
-const { TEXT: referenceText } = require("../src/ui/collaboration_dashboard/i18n.js");
-const { __test } = require("../src/ui/collaboration_dashboard/index.ui.js");
+const indexSource = fs.readFileSync(path.join(root, "src/ui/collaboration_dashboard/index.ui.ts"), "utf8");
+const { TEXT: referenceText } = require("../dist/ui/collaboration_dashboard/i18n.js");
+const { __test } = require("../dist/ui/collaboration_dashboard/index.ui.js");
 
 test("reference dashboard copy tracks active fixed-copy keys", () => {
   for (const language of ["zh", "en"]) {

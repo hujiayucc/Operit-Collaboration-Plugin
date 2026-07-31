@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "toolpkg_id": "com.operit.collaboration_orchestrator",
-  "version": "1.0.1",
-  "main": "src/main.js",
+  "version": "1.0.2",
+  "main": "dist/main.js",
   "display_name": {
     "zh": "多 Agent 协作调度器",
     "en": "Multi-Agent Collaboration Orchestrator"
@@ -15,20 +15,20 @@
   "subpackages": [
     {
       "id": "collaboration",
-      "entry": "src/packages/collaboration.js",
+      "entry": "dist/packages/collaboration.js",
       "enabled_by_default": true,
       "display_name": {
         "zh": "Agent 协作工具",
         "en": "Agent Collaboration Tools"
       },
       "description": {
-        "zh": "提供六个协作工具，用于创建与跟踪 Agent、投递消息、续接终态 Run、等待和中断。Agent、Run、消息和检查点优先持久化到 SQLite Event Store schema v3，SQLite 不可用时响应会标明内存回退。spawn、send、followup 和 interrupt 支持 request_id 幂等；执行 epoch 隔离恢复与迟到结果。全局活动 Run 可配置为 1–16，单根任务树活动槽可配置为 1–8，单根上限不高于全局上限。宿主 AI 瞬时故障自动重试 0–12 次，默认 5 次；余额、认证、参数和策略错误不重试。写路径和只读标记仅用于调度检查及提示约束，不构成操作系统权限隔离。",
-        "en": "Provides six tools to create and track agents, deliver messages, continue terminal Runs, wait, and interrupt. Agents, Runs, messages, and checkpoints prefer SQLite Event Store schema v3, with responses reporting an in-memory fallback when SQLite is unavailable. Spawn, send, follow-up, and interrupt support request_id idempotency; execution epochs isolate recovery and late results. Global active Runs are configurable from 1 to 16 and per-root active slots from 1 to 8, with the per-root limit no higher than the global limit. Transient host AI failures are retried 0-12 times, default 5; balance, authentication, parameter, and policy errors are not retried. Write paths and read-only flags are scheduling and prompt constraints, not OS permission isolation."
+        "zh": "提供十三个协作与控制工具，用于创建与跟踪 Agent、投递消息、续接终态 Run、等待、中断、详情与任务树查询、事件监听、设置和历史管理。Agent、Run、消息、检查点、树上下文和 Agent 游标优先持久化到 SQLite Event Store schema v4，SQLite 不可用时响应会标明内存回退。spawn、send、followup 和 interrupt 支持 request_id 幂等；执行 epoch 隔离恢复与迟到结果。全局活动 Run 可配置为 1–16 或 0（不限），单根任务树活动槽可配置为 1–8 或 0（不限）；两者有限时单根上限不高于全局上限。宿主 AI 瞬时故障自动重试 0–12 次，默认 5 次，-1 表示不限；余额、认证、参数和策略错误不重试。写路径和只读标记仅用于调度检查及提示约束，不构成操作系统权限隔离。",
+        "en": "Provides thirteen collaboration and control tools for creating and tracking agents, messaging, continuing terminal Runs, waiting, interruption, detail and task-tree queries, event watching, settings, and history management. Agents, Runs, messages, checkpoints, tree context, and Agent cursors prefer SQLite Event Store schema v4, with responses reporting an in-memory fallback when SQLite is unavailable. Spawn, send, follow-up, and interrupt support request_id idempotency; execution epochs isolate recovery and late results. Global active Runs are configurable from 1 to 16 or 0 for unlimited, and per-root active slots from 1 to 8 or 0 for unlimited; when both are finite, the per-root limit cannot exceed the global limit. Transient host AI failures are retried 0-12 times, default 5, with -1 meaning unlimited; balance, authentication, parameter, and policy errors are not retried. Write paths and read-only flags are scheduling and prompt constraints, not OS permission isolation."
       }
     },
     {
       "id": "tool_lifecycle_probe",
-      "entry": "src/packages/tool_lifecycle_probe.js",
+      "entry": "dist/packages/tool_lifecycle_probe.js",
       "enabled_by_default": true,
       "display_name": {
         "zh": "工具生命周期探针与 Agent 工具网关",

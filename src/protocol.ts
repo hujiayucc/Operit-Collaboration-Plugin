@@ -1,6 +1,4 @@
-"use strict";
-
-const CHANNELS = Object.freeze({
+export const CHANNELS = Object.freeze({
   SPAWN_AGENT: "collaboration.spawn_agent",
   LIST_AGENTS: "collaboration.list_agents",
   SEND_MESSAGE: "collaboration.send_message",
@@ -9,6 +7,7 @@ const CHANNELS = Object.freeze({
   INTERRUPT_AGENT: "collaboration.interrupt_agent",
   INSPECT_AGENT: "collaboration.inspect_agent",
   LIST_TREE: "collaboration.list_tree",
+  WATCH_TREE_EVENTS: "collaboration.watch_tree_events",
   GET_SETTINGS: "collaboration.get_settings",
   UPDATE_SETTINGS: "collaboration.update_settings",
   DELETE_AGENT: "collaboration.delete_agent",
@@ -22,13 +21,24 @@ const CHANNELS = Object.freeze({
   GATEWAY_STATUS: "gateway.status",
 });
 
-const IPC_OPTIONS = Object.freeze({ targetRuntime: "main" });
+export type ToolFailureEnvelope = {
+  transport_success: true;
+  operation_success: false;
+  result: {
+    success: false;
+    error: {
+      code: string;
+      message: string;
+      details: Record<string, unknown>;
+    };
+  };
+};
 
-function asText(value) {
+export function asText(value: unknown): string {
   return value === undefined || value === null ? "" : String(value);
 }
 
-function parseJson(value, fieldName) {
+export function parseJson(value: unknown, fieldName: unknown): unknown {
   const text = asText(value).trim();
   if (!text) {
     throw new Error(`${fieldName} is required`);
@@ -40,17 +50,17 @@ function parseJson(value, fieldName) {
   }
 }
 
-function parseOptionalStringArray(value, fieldName) {
+export function parseOptionalStringArray(value: unknown, fieldName: unknown): string[] | undefined {
   const text = asText(value).trim();
   if (!text) return undefined;
   const parsed = parseJson(text, fieldName);
-  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+  if (!Array.isArray(parsed) || parsed.some((item: unknown) => typeof item !== "string")) {
     throw new Error(`${fieldName} must be a JSON string array`);
   }
-  return parsed.map((item) => item.trim()).filter(Boolean);
+  return parsed.map((item) => (item as string).trim()).filter(Boolean);
 }
 
-function classifyErrorCode(message) {
+export function classifyErrorCode(message: unknown): string {
   const text = String(message || "");
   if (/valid JSON|JSON string array|string array/i.test(text)) return "invalid_json";
   if (/request_id conflict/i.test(text)) return "request_id_conflict";
@@ -68,9 +78,13 @@ function classifyErrorCode(message) {
   return "operation_failed";
 }
 
-function toolFailure(error, operation, details = {}) {
+export function toolFailure(
+  error: unknown,
+  operation: unknown,
+  details: Record<string, unknown> = {},
+): ToolFailureEnvelope {
   const message = error instanceof Error ? error.message : String(error);
-  const failure = {
+  const failure: ToolFailureEnvelope["result"] = {
     success: false,
     error: {
       code: classifyErrorCode(message),
@@ -85,17 +99,6 @@ function toolFailure(error, operation, details = {}) {
   };
 }
 
-function formatJson(value) {
+export function formatJson(value: unknown): string | undefined {
   return JSON.stringify(value, null, 2);
 }
-
-module.exports = {
-  CHANNELS,
-  IPC_OPTIONS,
-  asText,
-  classifyErrorCode,
-  parseJson,
-  parseOptionalStringArray,
-  toolFailure,
-  formatJson,
-};

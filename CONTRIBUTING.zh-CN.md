@@ -4,27 +4,27 @@
 
 ## 项目结构
 
-- `src/main.js`：main runtime 注册、IPC 处理、提示历史采集、生命周期诊断和 Agent 工具网关。
-- `src/protocol.js`：IPC 通道名称、参数解析和宿主兼容错误信封。
-- `src/collaboration/model.js`：Agent 与 Run 数据结构、校验、限制、公开投影和终态规则。
-- `src/collaboration/manager.js`：调度、任务树、消息、重试、检查点、动作门、恢复、中断和结果发布。
-- `src/collaboration/engine.js`：宿主 AI 调用、流收集、系统/任务提示、控制解析、摘要和 finalization 交接。
-- `src/collaboration/helpers.js`：解析、脱敏、路径处理、截取和共享结果工具。
-- `src/collaboration/store.js`：SQLite Event Store schema v3、迁移、事务、账本和明确的内存回退。
-- `src/packages/`：六个 collaboration 工具和七个 probe/gateway 工具的公开 ToolPkg 元数据与包装器。
+- `src/main.ts`：main runtime 注册、IPC 处理、提示历史采集、生命周期诊断和 Agent 工具网关。
+- `src/protocol.ts`：IPC 通道名称、参数解析和宿主兼容错误信封。
+- `src/collaboration/model.ts`：Agent 与 Run 数据结构、校验、限制、公开投影和终态规则。
+- `src/collaboration/manager.ts`：调度、任务树、消息、重试、检查点、动作门、恢复、中断和结果发布。
+- `src/collaboration/engine.ts`：宿主 AI 调用、流收集、系统/任务提示、控制解析、摘要和 finalization 交接。
+- `src/collaboration/helpers.ts`：解析、脱敏、路径处理、截取和共享结果工具。
+- `src/collaboration/store.ts`：SQLite Event Store schema v4、迁移、事务、树上下文、游标、账本和明确的内存回退。
+- `src/packages/`：十三个 collaboration/control 工具和七个 probe/gateway 工具的公开 ToolPkg 元数据与包装器。
 - `src/ui/collaboration_dashboard/`：原生 Compose DSL 控制台、main runtime IPC 客户端、校验、视图模型、组件和双语文案。
 - `prompts/`：六份仅存在于源码中的操作提示模板；参与测试，但不进入安装包。
 - `types/runtime.d.ts`：本项目使用的 ToolPkg 宿主 API 接口。
 - `test/`：单元、集成、持久化、恢复、元数据、打包、探针和 UI 回归测试。
-- `scripts/build-toolpkg.js`：可复现的 ToolPkg 构建器和压缩阶段验证器。
+- `scripts/build-toolpkg.js`：可复现的 ToolPkg 构建器和单行阶段验证器。
 
 ## 运行时契约
 
 以下行为属于兼容性敏感契约：
 
 - 公开工具、包导出、源码 `METADATA` 与 `manifest.json` 描述必须一致。
-- IPC 名称集中定义在 `src/protocol.js`；main runtime 处理器、包包装器和控制台调用必须同步。
-- Agent、Run、消息、事件、检查点、attempt、请求账本和副作用账本必须保持 SQLite Event Store schema v3 语义，除非变更包含经过测试的原子迁移。
+- IPC 名称集中定义在 `src/protocol.ts`；main runtime 处理器、包包装器和控制台调用必须同步。
+- Agent、Run、消息、事件、检查点、树上下文、游标、attempt、请求账本和副作用账本必须保持 SQLite Event Store schema v4 语义，除非变更包含经过测试的原子迁移。
 - SQLite 异常必须明确报告为 `persistence: "memory"`，不得伪装成正常 SQLite 操作。
 - `request_id` 仅在操作相同且规范化参数完全一致时幂等复用；冲突复用必须继续报错。
 - execution epoch 隔离恢复 attempt、取消和迟到模型结果；旧 epoch 不得推进当前 Run。
@@ -54,8 +54,8 @@
 
 - `manifest.json`
 - `src/packages/` 中的子包 `METADATA` 块和导出包装器
-- `src/protocol.js`
-- `src/main.js` 中的处理器注册
+- `src/protocol.ts`
+- `src/main.ts` 中的处理器注册
 - collaboration manager 对应操作
 - 适用时的控制台 API、校验、表单和结果渲染
 - 中英文描述
@@ -64,7 +64,7 @@
 
 修改运行时限制、状态字段、设置、事件或控制行为时，应同步更新 model、manager、持久化投影、公开投影、控制台文案/渲染、文档和测试。
 
-修改控制台固定文案时，应保持 `src/ui/collaboration_dashboard/i18n.js` 与 `index.ui.js` 中宿主要求的内联文案一致，并保留独立的 Compose DSL 注册路径。
+修改控制台固定文案时，应保持 `src/ui/collaboration_dashboard/i18n.ts` 与 `index.ui.ts` 中宿主要求的内联文案一致，并保留独立的 Compose DSL 注册路径；两者都会编译为 `dist/` 下的 `.js` 运行时模块。
 
 修改协作指令或公开工具语义时，应检查 `prompts/` 下全部六份文件。完整版、只读版、mini 版以及中英文版本必须按各自详细程度描述同一 ToolPkg 契约。
 
@@ -78,23 +78,23 @@
 
 - `test/collaboration-unit.test.js`：规范化、解析、重试分类、动作门、设置和调度器单元逻辑。
 - `test/collaboration.test.js`：manager 与 engine 端到端行为、控制、消息、重试、finalization 和任务树。
-- `test/store.test.js`：schema v3、迁移、事务、只追加数据、请求、副作用和删除。
+- `test/store.test.js`：schema v4、迁移、树上下文、游标、事务、只追加数据、请求、副作用和删除。
 - `test/recovery.test.js`：重启与 attempt 恢复行为。
 - `test/probe.test.js`：生命周期观察、归因、提示组装和网关过滤。
 - `test/metadata.test.js`、`test/package.test.js`、`test/build-toolpkg.test.js`：公开元数据、包装器、运行时文件清单、提示契约和打包。
 - `test/ui-*.test.js`：控制台 API、文案、校验、渲染、注册和交互行为。
 - `test/integration.test.js`：main runtime、子包和宿主服务集成。
 
-使用 Node 检查每个发生变更的 JavaScript 文件，然后运行完整测试：
+先对 TypeScript 源码树执行类型检查和编译，再运行完整测试。首先安装锁定的开发依赖；若文件系统不支持符号链接，请在安装命令后添加 `--no-bin-links`。
 
 ```bash
-node --check src/collaboration/engine.js
-node --check src/collaboration/manager.js
-node --check src/main.js
-node --test test/*.test.js
+npm install
+npm run check:migration
+npm run typecheck
+npm test
 ```
 
-应根据实际修改调整 `node --check` 文件列表。完整测试数量会随用例新增而变化；验收标准是零失败，不是固定测试数量。
+完整测试数量会随用例新增而变化；验收标准是零失败，不是固定测试数量。
 
 测试应保持确定性，关闭其创建的 manager 和 store，释放被挂起的异步工作，并同时验证 Run 状态与真实副作用。Agent Run 成功不等于文件变更或持久化投影已经核验。
 
@@ -103,22 +103,23 @@ node --test test/*.test.js
 在项目根目录执行：
 
 ```bash
-node scripts/build-toolpkg.js
+npm run build
 ```
 
 若预期归档已存在，无参数命令会报告跳过并以成功状态结束，不会覆盖文件。完成验证后需要重新构建时：
 
 ```bash
-node scripts/build-toolpkg.js --replace
+npm run build:replace
 ```
 
 构建器会：
 
-- 暂存明确列出的运行时文件；
-- 使用固定版本 `terser@5.31.6` 压缩每个入包 JavaScript 文件；
-- 要求每个压缩后的 JavaScript 文件严格为一行非空内容；
+- 使用固定版本 `typescript@5.9.3` 将 TypeScript 源码编译到仓库的 `dist/` 目录；
+- 把 `dist/` 中明确列出的已编译运行时文件复制到安装包的 `dist/` 目录，不打包 TypeScript 源文件；
+- 固定使用 `terser@5.31.6` 执行两轮保守压缩，关闭 `unsafe` 和顶层转换，并保持函数名、类名、参数名、局部变量名及属性名不混淆；
+- 要求每个入包 JavaScript 文件严格为一行非空内容；
 - 对暂存 JavaScript 执行语法检查；
-- 针对压缩后的暂存目录运行完整测试套件；
+- 针对单行化后的暂存目录运行完整测试套件；
 - 验证构建过程未修改源码 JavaScript；
 - 写入归档并报告大小、条目数和 SHA-256。
 
@@ -134,5 +135,5 @@ node scripts/build-toolpkg.js --replace
 - 敏感工具载荷和瞬时 finalization 交接未进入持久化或公开状态；
 - 聚焦回归测试和完整测试套件均通过；
 - 发生变更的 JavaScript 文件通过语法检查；
-- 与打包相关的变更通过压缩阶段构建；
+- 与打包相关的变更通过单行阶段构建；
 - 适用的用户可见行为已在两种 UI 语言中准确记录。

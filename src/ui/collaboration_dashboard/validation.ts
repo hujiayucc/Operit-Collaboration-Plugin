@@ -1,6 +1,24 @@
-"use strict";
+type ValidationInput = {
+  task?: unknown;
+  workspace_env?: unknown;
+  priority?: unknown;
+  timeout_ms?: unknown;
+  max_tool_calls?: unknown;
+  read_only?: unknown;
+  target_paths_text?: unknown;
+  workspace_path?: unknown;
+  permission_mode?: unknown;
+  [key: string]: unknown;
+};
 
-function parseTargetPaths(text) {
+type ValidationResult = {
+  valid: boolean;
+  errors: string[];
+  target_paths: string[] | undefined;
+  read_only?: boolean | undefined;
+};
+
+export function parseTargetPaths(text: unknown): string[] {
   return Array.from(new Set(
     String(text || "")
       .split(/\r?\n/)
@@ -9,16 +27,16 @@ function parseTargetPaths(text) {
   ));
 }
 
-function isAbsolutePath(value) {
+export function isAbsolutePath(value: unknown): boolean {
   const path = String(value || "").trim();
   return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
 }
 
-function normalizeForCompare(value) {
+function normalizeForCompare(value: unknown): string {
   return String(value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-function isWithinWorkspace(path, workspace) {
+export function isWithinWorkspace(path: unknown, workspace: unknown): boolean {
   const child = normalizeForCompare(path);
   const root = normalizeForCompare(workspace);
   if (!root) return true;
@@ -27,20 +45,24 @@ function isWithinWorkspace(path, workspace) {
   return left === right || left.startsWith(`${right}/`);
 }
 
-function validateCommon(input) {
-  const errors = [];
+function validateCommon(input: ValidationInput): string[] {
+  const errors: string[] = [];
   if (!String(input.task || "").trim()) errors.push("task_required");
   if (!["android", "linux"].includes(String(input.workspace_env || "android"))) errors.push("workspace_env_invalid");
   if (!["high", "normal", "low"].includes(String(input.priority || "normal"))) errors.push("priority_invalid");
   const timeout = Number(input.timeout_ms);
-  if (!Number.isInteger(timeout) || timeout < 30000 || timeout > 3600000) errors.push("timeout_invalid");
+  if (!Number.isInteger(timeout) || (timeout !== 0 && (timeout < 30000 || timeout > 3600000))) {
+    errors.push("timeout_invalid");
+  }
   const maxTools = Number(input.max_tool_calls);
-  if (!Number.isInteger(maxTools) || maxTools < 1 || maxTools > 64) errors.push("max_tool_calls_invalid");
+  if (!Number.isInteger(maxTools) || (maxTools !== 0 && (maxTools < 1 || maxTools > 64))) {
+    errors.push("max_tool_calls_invalid");
+  }
   return errors;
 }
 
-function validatePaths(input, paths) {
-  const errors = [];
+function validatePaths(input: ValidationInput, paths: string[]): string[] {
+  const errors: string[] = [];
   if (input.read_only !== true && paths.length === 0) errors.push("write_paths_required");
   for (const path of paths) {
     if (!isAbsolutePath(path)) errors.push("path_not_absolute");
@@ -49,20 +71,23 @@ function validatePaths(input, paths) {
   return Array.from(new Set(errors));
 }
 
-function validateSpawn(input) {
+export function validateSpawn(input: ValidationInput): ValidationResult {
   const paths = input.read_only === true ? [] : parseTargetPaths(input.target_paths_text);
   const errors = [...validateCommon(input), ...validatePaths(input, paths)];
   if (input.workspace_path && !isAbsolutePath(input.workspace_path)) errors.push("workspace_not_absolute");
   return { valid: errors.length === 0, errors: Array.from(new Set(errors)), target_paths: paths };
 }
 
-function validateFollowup(input, currentAgent) {
-  const errors = [];
+export function validateFollowup(
+  input: ValidationInput,
+  currentAgent: object | null | undefined,
+): ValidationResult {
+  const errors: string[] = [];
   if (!String(input.task || "").trim()) errors.push("task_required");
   const mode = String(input.permission_mode || "readonly");
   if (!["inherit", "readonly", "write"].includes(mode)) errors.push("permission_mode_invalid");
-  let targetPaths;
-  let readOnly;
+  let targetPaths: string[] | undefined;
+  let readOnly: boolean | undefined;
   if (mode === "readonly") {
     targetPaths = [];
     readOnly = true;
@@ -77,13 +102,10 @@ function validateFollowup(input, currentAgent) {
     readOnly = undefined;
     if (!currentAgent) errors.push("agent_required");
   }
-  return { valid: errors.length === 0, errors: Array.from(new Set(errors)), target_paths: targetPaths, read_only: readOnly };
+  return {
+    valid: errors.length === 0,
+    errors: Array.from(new Set(errors)),
+    target_paths: targetPaths,
+    read_only: readOnly,
+  };
 }
-
-module.exports = {
-  isAbsolutePath,
-  isWithinWorkspace,
-  parseTargetPaths,
-  validateFollowup,
-  validateSpawn,
-};

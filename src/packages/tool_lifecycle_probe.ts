@@ -1,13 +1,3 @@
-"use strict";
-
-const { toolFailure } = require("../protocol.js");
-
-function toolOutcome(result) {
-  return result && result.transport_success === true && result.operation_success === false
-    ? result.result
-    : result;
-}
-
 /* METADATA
 {
   "name": "tool_lifecycle_probe",
@@ -37,7 +27,7 @@ function toolOutcome(result) {
         "en": "Returns recent filtered lifecycle events in chronological order with returned, buffer-local matched, and process-cumulative total_events. After clearing the buffer, matched may be zero while total_events remains unchanged. Entries record chat_id, proxy_sender_name, invocation_id, and identity_bearing without retaining complete tool parameter or result values. Tool-name and sender filters are exact; intercept_only limits results to the pre-execution phase."
       },
       "parameters": [
-        { "name": "limit", "description": { "zh": "返回的最大条目数；有效正数会向下取整并限制为 500，省略、非数值、非有限值或非正数均回退为 100。", "en": "Maximum entries to return; positive values are floored and capped at 500. Omitted, non-numeric, non-finite, or non-positive values fall back to 100." }, "type": "number", "required": false },
+        { "name": "limit", "description": { "zh": "返回的最大条目数；0 表示返回缓冲中全部匹配项（最多 500），正数向下取整并封顶 500，省略或无效值回退为 100。", "en": "Maximum entries to return. 0 returns every matching buffered entry, up to 500; positive values are floored and capped at 500, while omitted or invalid values default to 100." }, "type": "number", "required": false },
         { "name": "tool_name", "description": { "zh": "可选，仅返回该工具名的事件。", "en": "Optional; return only events for this tool name." }, "type": "string", "required": false },
         { "name": "proxy_sender_name", "description": { "zh": "可选，仅返回该发送者标识的事件。", "en": "Optional; return only events for this sender identity." }, "type": "string", "required": false },
         { "name": "intercept_only", "description": { "zh": "为 true 时仅返回调用前拦截阶段的事件。", "en": "When true, return only pre-execution intercept-phase events." }, "type": "boolean", "required": false }
@@ -93,11 +83,41 @@ function toolOutcome(result) {
 }
 */
 
+import { toolFailure } from "../protocol.js";
+
+type ToolParams = Record<string, unknown>;
+
+type TransportFailure = {
+  success: false;
+  error?: unknown;
+  [key: string]: unknown;
+};
+
+type TransportSuccess = {
+  success?: true;
+  transport_success?: boolean;
+  operation_success?: boolean;
+  result?: unknown;
+  [key: string]: unknown;
+};
+
+type ToolResult = TransportFailure | TransportSuccess;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toolOutcome(result: ToolResult): unknown {
+  return result && result.transport_success === true && result.operation_success === false
+    ? result.result
+    : result;
+}
+
 // This subpackage runs in a "sandbox" JS context (TOOLPKG_FORMAT_GUIDE §3.2.5).
 // All state lives in the "main" context (main.js). These sandbox tools are thin
 // IPC forwarders: ToolPkg.ipc.call routes to the main context.
 
-async function safely(operation, action) {
+async function safely(operation: string, action: () => Promise<ToolResult>): Promise<unknown> {
   try {
     return toolOutcome(await action());
   } catch (error) {
@@ -105,54 +125,54 @@ async function safely(operation, action) {
   }
 }
 
-function callerChatId(params) {
+function callerChatId(params: ToolParams): string {
   return String((params || {}).__operit_package_chat_id || "").trim();
 }
 
-function callMain(channel, payload, params) {
+function callMain(channel: string, payload: ToolParams, params: ToolParams): Promise<ToolResult> {
   return ToolPkg.ipc.call(channel, {
     ...(payload || {}),
     caller_chat_id: callerChatId(params),
   });
 }
 
-async function probe_get_status(params) {
+export async function probe_get_status(params: ToolParams): Promise<unknown> {
   return safely("probe_get_status", () => callMain("probe.get_status", {}, params));
 }
 
-async function probe_get_log(params) {
+export async function probe_get_log(params: ToolParams): Promise<unknown> {
   return safely("probe_get_log", () => callMain("probe.get_log", params || {}, params));
 }
 
-async function probe_clear_log(params) {
+export async function probe_clear_log(params: ToolParams): Promise<unknown> {
   return safely("probe_clear_log", () => callMain("probe.clear_log", {}, params));
 }
 
-async function probe_get_prompt_compose_log(params) {
+export async function probe_get_prompt_compose_log(params: ToolParams): Promise<unknown> {
   return safely("probe_get_prompt_compose_log", () => callMain("probe.get_prompt_compose_log", {}, params));
 }
 
-function parseOptionalToolNames(value, fieldName) {
+function parseOptionalToolNames(value: unknown, fieldName: string): string[] | undefined {
   const text = value === undefined || value === null ? "" : String(value).trim();
   if (!text) return undefined;
-  let parsed;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (error) {
     throw new Error(`${fieldName} must be valid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+  if (!Array.isArray(parsed) || parsed.some((item: unknown) => typeof item !== "string")) {
     throw new Error(`${fieldName} must be a JSON string array`);
   }
-  return Array.from(new Set(parsed.map((item) => item.trim()).filter(Boolean)));
+  return Array.from(new Set(parsed.map((item) => (item as string).trim()).filter(Boolean)));
 }
 
-async function gateway_register(params) {
+export async function gateway_register(params: ToolParams): Promise<unknown> {
   return safely("gateway_register", () => {
     const p = params || {};
     const agentId = String(p.agent_id || "").trim();
     if (!agentId) throw new Error("agent_id is required");
-    const payload = {
+    const payload: ToolParams = {
       agent_id: agentId,
       caller_chat_id: String(p.__operit_package_chat_id || "").trim(),
     };
@@ -164,7 +184,7 @@ async function gateway_register(params) {
   });
 }
 
-async function gateway_unregister(params) {
+export async function gateway_unregister(params: ToolParams): Promise<unknown> {
   return safely("gateway_unregister", () => {
     const agentId = String((params || {}).agent_id || "").trim();
     if (!agentId) throw new Error("agent_id is required");
@@ -174,16 +194,8 @@ async function gateway_unregister(params) {
   });
 }
 
-async function gateway_status(params) {
+export async function gateway_status(params: ToolParams): Promise<unknown> {
   return safely("gateway_status", () => callMain("gateway.status", {}, params));
 }
 
-module.exports = {
-  probe_get_status,
-  probe_get_log,
-  probe_clear_log,
-  probe_get_prompt_compose_log,
-  gateway_register,
-  gateway_unregister,
-  gateway_status,
-};
+export {};

@@ -4,18 +4,25 @@
 
 仅在任务可拆成相互独立、可并行或需隔离上下文的子任务时使用多 Agent。简单串行工作、强依赖同一未稳定中间结果的步骤，留在主 Agent 执行。主 Agent 始终负责拆分、调度、进度跟踪、冲突处理、独立验证和最终交付；子 Agent 的终态或文字报告不等于结果已验证。
 
-分派时明确任务目标、范围、首个可执行动作、已完成和剩余动作、完成判据与验证要求，并按当前契约设置必要的 `context`、`include_conversation_context`、`workspace_env`、`workspace_path`、`target_paths_json`、`read_only`、`priority`、`timeout_ms` 与 `max_tool_calls`。`timeout_ms` 是宿主模型流的网络空闲超时，仅度量首个响应块或相邻响应块的等待时间；持续输出不受总生成时长限制。写任务必须提供非空 `target_paths_json`，且路径应为 `workspace_path` 内的绝对路径；未提供有效目标路径时按只读处理。`read_only` 与写路径用于调度检查和提示约束，不构成操作系统级权限隔离。避免多个 Agent 写同一路径；必须共享结果时，由主 Agent 规定所有权和交接顺序。
+分派时明确任务目标、范围、首个可执行动作、已完成和剩余动作、完成判据与验证要求，并按当前契约设置必要的 `context`、`include_conversation_context`、`workspace_env`、`workspace_path`、`target_paths_json`、`read_only`、`priority`、`timeout_ms` 与 `max_tool_calls`。`timeout_ms` 是宿主模型流的网络空闲超时：`0` 表示不限，其他值为 30000–3600000 范围内的整数；它仅度量首个响应块或相邻响应块的等待时间，持续输出不受总生成时长限制。全局 `max_tool_calls` 可设为 1–64，`0` 表示不限。写任务必须提供非空 `target_paths_json`，且路径应为 `workspace_path` 内的绝对路径；未提供有效目标路径时按只读处理。`read_only` 与写路径用于调度检查和提示约束，不构成操作系统级权限隔离。避免多个 Agent 写同一路径；必须共享结果时，由主 Agent 规定所有权和交接顺序。
 
 宿主 AI 的网络、限流、超时和服务临时异常按全局 `max_model_retries` 自动重试 0–12 次，默认 5；余额不足、认证、参数、上下文超限和策略拒绝不重试。若失败前工具可能已执行，下一次请求先用读取/搜索工具核验目标状态，再决定后续变更。
 
-## 2. collaboration 六工具
+## 2. collaboration 十三工具
 
 - `spawn_agent`：创建稳定 logical agent，并以 `run_seq=1` 非阻塞排队首个 Run；`delivery=queued` 只表示创建和入队成功，不表示任务完成。
 - `list_agents`：按条件列出 Agent，查看当前及父/根 Run、树聚合、消息与控制状态、终态结果；用于持续跟踪和确认实际状态。
 - `send_message`：向 active Agent 的持久 inbox 投递消息；消息在当前 host call 返回后的下一个 checkpoint 才进入新上下文。host 接收表示 delivered，只有模型通过 `message_acks` 回执才算 acknowledged；未确认消息可再次投递。
 - `followup_task`：仅对 terminal Agent 创建新 Run，保留 `agent_id`，递增 `run_seq`，使用新的 execution epoch 与 root Run，并携带近期摘要；active Agent 应使用 `send_message`。
-- `wait_agent`：通过非空 `agent_ids_json` 指定 Agent，等待其全部 terminal，并返回各自当前精确 root Run 的裁剪结果和树聚合；`timed_out=true` 只表示本次等待到期，不表示任务失败，也不会取消工作。
+- `wait_agent`：通过非空 `agent_ids_json` 指定 Agent，等待其全部 terminal，并返回各自当前精确 root Run 的裁剪结果和树聚合；`timeout_ms` 默认 12000，1000–12000 表示有限等待，`0` 表示不限时等待；`timed_out=true` 只表示本次有限等待到期，不表示任务失败，也不会取消工作。
 - `interrupt_agent`：请求中断当前 Run，并只向该 Run 的活动后代传播；queued 可立即变为 interrupted，running 可能先变为 cancelling。请求成功不等于底层调用已停止，随后用 `list_agents` 或 `wait_agent` 确认终态。
+- `inspect_agent`：通过 `agent_id` 查询单个 Agent 的详细状态，包括当前 Run、消息、控制状态和任务树信息。
+- `list_tree`：通过 `agent_id` 列出以该 Agent 为根的任务树节点。
+- `watch_tree_events`：通过 `root_run_id` 长轮询任务树事件；`after_revision` 只返回指定 revision 之后的增量，`limit` 限制单次条目数。
+- `get_settings`：读取当前协作调度器全局设置。
+- `update_settings`：更新全局 active Run、单根 active Run、工具调用预算、模型重试和对话上下文模式。
+- `delete_agent`：通过 `agent_id` 删除已终止 Agent 及其历史；活动 Agent 不可删除。
+- `clear_history`：清除所有已终止 Agent 的历史记录。
 
 `spawn_agent`、`send_message`、`followup_task`、`interrupt_agent` 支持 `request_id` 幂等。只在同一逻辑副作用重试时复用同一 `request_id`；新意图必须使用新值。参数名称、必填/可选关系和行为契约以当前 `METADATA` 为准，不凭相似工具推断。
 
@@ -41,7 +48,7 @@ COLLABORATION_CONTROL: {"version":1,"execution_epoch":"<当前 epoch>","action":
 
 ## 5. 持久化、恢复与错误
 
-Agents、Runs、messages、checkpoints 优先写入 SQLite Event Store schema v3；SQLite 不可用时响应会标明 `persistence = memory` 内存回退。内存回退不具备进程重启持久性，不能据此假定历史、幂等记录或诊断缓冲跨重启保留。恢复时依据 stable `agent_id`、`run_seq`、root Run 和 execution epoch 对齐当前工作，排除旧 epoch 的迟到结果。
+Agents、Runs、messages、checkpoints、tree context 和 Agent cursors 优先写入 SQLite Event Store schema v4；SQLite 不可用时响应会标明 `persistence = memory` 内存回退。内存回退不具备进程重启持久性，不能据此假定历史、幂等记录或诊断缓冲跨重启保留。恢复时依据 stable `agent_id`、`run_seq`、root Run 和 execution epoch 对齐当前工作，排除旧 epoch 的迟到结果。
 
 错误使用宿主兼容传输信封 `{ transport_success: true, operation_success: false, result: { success: false, error } }`。先检查 `transport_success`、`operation_success`，再读取 `result.error` 区分参数错误、状态冲突、超时、容量限制和持久化回退；直接调用包函数时同一失败会解包为 `{ success: false, error }`。参数错误且确认无副作用时修正后重试，副作用状态不明时先查询验证。
 

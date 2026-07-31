@@ -1,28 +1,107 @@
-"use strict";
-
-const { CHANNELS } = require("./protocol.js");
-const {
-  SUMMARY_CHAT_PREFIX: COLLAB_SUMMARY_CHAT_PREFIX,
-  AGENT_CHAT_PREFIX: COLLAB_AGENT_CHAT_PREFIX,
-  FINALIZATION_CHAT_PREFIX: COLLAB_FINALIZATION_CHAT_PREFIX,
+import { CHANNELS } from "./protocol.js";
+import {
+  SUMMARY_CHAT_PREFIX as COLLAB_SUMMARY_CHAT_PREFIX,
+  AGENT_CHAT_PREFIX as COLLAB_AGENT_CHAT_PREFIX,
+  FINALIZATION_CHAT_PREFIX as COLLAB_FINALIZATION_CHAT_PREFIX,
   actionGateToolAllowed,
-} = require("./collaboration/engine.js");
-const { createCollaborationManager } = require("./collaboration/manager.js");
+} from "./collaboration/engine.js";
+import { createCollaborationManager } from "./collaboration/manager.js";
+import * as dashboardModule from "./ui/collaboration_dashboard/index.ui.js";
+
+type DynamicRecord = Record<string, unknown>;
+type ConversationTurn = { kind: string; content: string };
+type FileGatewayPolicy = { allowedTools: Set<string>; deniedTools: Set<string> };
+type RuntimeActionGate = {
+  kind: string;
+  pendingMetadata: string[];
+  allowedTools: string[];
+  mutationCheckpointIndex?: number;
+  failedAttempts?: number;
+  unknownOutcome?: boolean;
+};
+type GatewayDecision = {
+  result: { availableTools?: unknown[]; deniedTools?: string[] };
+  action: string;
+  count: number;
+};
+type ProbeAttribution = { kind: string; agent_id: string };
+type ProbeEntry = {
+  seq: number;
+  at: number;
+  event_name: string;
+  tool_name: string;
+  proxy_sender_name: string;
+  proxy_sender_source: string;
+  chat_id: string;
+  invocation_id: string;
+  identity_bearing: boolean;
+  toolpkg_id: string;
+  attribution_kind: string;
+  attribution_source: string;
+  attributed_agent_id: string;
+  execution_epoch: string;
+  is_intercept_phase: boolean;
+  payload_keys: string[];
+  event_keys: string[];
+  nested_event_keys: string[];
+};
+type ProbeStatus = {
+  registered: boolean;
+  registration_error: string;
+  hook_active: boolean;
+  total_events: number;
+  dropped_events: number;
+  events_by_name: Record<string, number>;
+  events_by_tool: Record<string, number>;
+  agent_attributed_events: number;
+  summary_attributed_events: number;
+  unattributed_events: number;
+  intercept_events: number;
+  identity_bearing_events: number;
+  identity_missing_events: number;
+  host_lifecycle_events: number;
+  host_identity_bearing_events: number;
+  runtime_attributed_events: number;
+  last_event_at: number;
+};
+type PromptComposeEntry = DynamicRecord & {
+  at: number;
+  chat_id: string;
+  proxy_sender_name: string;
+  metadata_proxy_sender: string;
+  metadata_keys: string[];
+  function_type: string;
+  prompt_function_type: string;
+  stage: string;
+  sub_task: string;
+  payload_keys: string[];
+  has_available_tools: boolean;
+  available_tools_count: number;
+  available_tool_names: string[];
+  first_tool_type: string;
+  first_tool_keys: string[];
+  gateway_action: string;
+  gateway_returned_tools: number;
+};
+
+function asRecord(value: unknown): DynamicRecord {
+  return value !== null && typeof value === "object" ? value as DynamicRecord : {};
+}
 
 let ipcRegistered = false;
 let dashboardUiRegistered = false;
 let dashboardUiRegistrationError = "";
-const conversationHistoryByChat = new Map();
+const conversationHistoryByChat = new Map<string, ConversationTurn[]>();
 const MAX_CONTEXT_CACHE_CHATS = 24;
 const MAX_CONTEXT_CACHE_TURNS = 40;
 const MAX_CONTEXT_CACHE_CHARS = 32000;
 
-function snapshotConversationHistory(history) {
-  const source = Array.isArray(history) ? history.slice(-MAX_CONTEXT_CACHE_TURNS) : [];
-  const reversed = [];
+function snapshotConversationHistory(history: unknown): ConversationTurn[] {
+  const source: unknown[] = Array.isArray(history) ? history.slice(-MAX_CONTEXT_CACHE_TURNS) : [];
+  const reversed: ConversationTurn[] = [];
   let remaining = MAX_CONTEXT_CACHE_CHARS;
   for (let index = source.length - 1; index >= 0 && remaining > 0; index -= 1) {
-    const turn = source[index] || {};
+    const turn = asRecord(source[index]);
     const kind = String(turn.kind || "").trim().toUpperCase();
     if (kind !== "USER" && kind !== "ASSISTANT") continue;
     let content = String(turn.content || "").trim();
@@ -34,7 +113,12 @@ function snapshotConversationHistory(history) {
   return reversed.reverse();
 }
 
-function rememberConversationHistory(chatId, chatHistory, preparedHistory, currentInput) {
+function rememberConversationHistory(
+  chatId: unknown,
+  chatHistory: unknown,
+  preparedHistory: unknown,
+  currentInput: unknown,
+): void {
   const id = String(chatId || "").trim();
   if (!id || id.startsWith(COLLAB_AGENT_CHAT_PREFIX) || id.startsWith(COLLAB_SUMMARY_CHAT_PREFIX) ||
     id.startsWith(COLLAB_FINALIZATION_CHAT_PREFIX)) return;
@@ -52,18 +136,20 @@ function rememberConversationHistory(chatId, chatHistory, preparedHistory, curre
   conversationHistoryByChat.delete(id);
   conversationHistoryByChat.set(id, snapshot);
   while (conversationHistoryByChat.size > MAX_CONTEXT_CACHE_CHATS) {
-    conversationHistoryByChat.delete(conversationHistoryByChat.keys().next().value);
+    const oldestChatId = conversationHistoryByChat.keys().next().value;
+    if (oldestChatId === undefined) break;
+    conversationHistoryByChat.delete(oldestChatId);
   }
 }
 
-function getConversationHistory(chatId) {
+function getConversationHistory(chatId: unknown): ConversationTurn[] {
   const snapshot = conversationHistoryByChat.get(String(chatId || "").trim()) || [];
-  return snapshot.map((turn) => ({ ...turn }));
+  return snapshot.map((turn: ConversationTurn) => ({ ...turn }));
 }
 
 const collaboration = createCollaborationManager({
   getConversationContext: getConversationHistory,
-  onAgentToolInvocation(details) {
+  onAgentToolInvocation(details: unknown) {
     if (typeof probeRecordAgentToolInvocation === "function") probeRecordAgentToolInvocation(details);
   },
 });
@@ -102,6 +188,7 @@ function registerIpc() {
   });
   ToolPkg.ipc.on(CHANNELS.INSPECT_AGENT, async (payload) => collaboration.inspect(payload));
   ToolPkg.ipc.on(CHANNELS.LIST_TREE, async (payload) => collaboration.listTree(payload));
+  ToolPkg.ipc.on(CHANNELS.WATCH_TREE_EVENTS, async (payload) => collaboration.watchTreeEvents(payload));
   ToolPkg.ipc.on(CHANNELS.GET_SETTINGS, async () => collaboration.getSettings());
   ToolPkg.ipc.on(CHANNELS.UPDATE_SETTINGS, async (payload) => collaboration.updateSettings(payload));
   ToolPkg.ipc.on(CHANNELS.DELETE_AGENT, async (payload) => collaboration.deleteAgent(payload));
@@ -122,14 +209,14 @@ function registerIpc() {
     assertPublicPluginToolCaller(payload);
     return probeGetPromptComposeLog(payload);
   });
-  ToolPkg.ipc.on(CHANNELS.GATEWAY_REGISTER, async (payload) => {
+  ToolPkg.ipc.on<DynamicRecord>(CHANNELS.GATEWAY_REGISTER, async (payload) => {
     assertPublicPluginToolCaller(payload);
-    registerFileGateway(payload && payload.agent_id, payload || {});
+    registerFileGateway(payload.agent_id, payload);
     return fileGatewayStatus();
   });
-  ToolPkg.ipc.on(CHANNELS.GATEWAY_UNREGISTER, async (payload) => {
+  ToolPkg.ipc.on<DynamicRecord>(CHANNELS.GATEWAY_UNREGISTER, async (payload) => {
     assertPublicPluginToolCaller(payload);
-    unregisterFileGateway(payload && payload.agent_id);
+    unregisterFileGateway(payload.agent_id);
     return fileGatewayStatus();
   });
   ToolPkg.ipc.on(CHANNELS.GATEWAY_STATUS, async (payload) => {
@@ -142,8 +229,8 @@ registerIpc();
 
 // Agent tool gateway: filters prompt-time tools and protects its own controls.
 // Ordinary non-plugin tools are unrestricted unless a per-agent policy narrows them.
-const fileGatewayAgents = new Map(); // agentId -> { allowedTools: Set, deniedTools: Set }
-const DEFAULT_DENIED_TOOLS = []; // empty: agents get all non-plugin tools by default
+const fileGatewayAgents = new Map<string, FileGatewayPolicy>();
+const DEFAULT_DENIED_TOOLS: string[] = []; // empty: agents get all non-plugin tools by default
 const FILE_GATEWAY_AGENT_PREFIX = "CollaborationAgent:";
 const AGENT_HIDDEN_TOOL_NAMES = new Set([
   "spawn_agent",
@@ -152,6 +239,13 @@ const AGENT_HIDDEN_TOOL_NAMES = new Set([
   "followup_task",
   "wait_agent",
   "interrupt_agent",
+  "inspect_agent",
+  "list_tree",
+  "watch_tree_events",
+  "get_settings",
+  "update_settings",
+  "delete_agent",
+  "clear_history",
   "probe_get_status",
   "probe_get_log",
   "probe_clear_log",
@@ -162,29 +256,33 @@ const AGENT_HIDDEN_TOOL_NAMES = new Set([
 ]);
 const AGENT_HIDDEN_TOOL_PREFIXES = ["collaboration:", "tool_lifecycle_probe:"];
 
-function gatewayCallerIsAgent(callerChatId) {
+function gatewayCallerIsAgent(callerChatId: unknown): boolean {
   const caller = String(callerChatId || "").trim();
   return caller.startsWith(COLLAB_AGENT_CHAT_PREFIX) || caller.startsWith(COLLAB_SUMMARY_CHAT_PREFIX) ||
     caller.startsWith(COLLAB_FINALIZATION_CHAT_PREFIX);
 }
 
-function assertPublicPluginToolCaller(payload) {
-  if (gatewayCallerIsAgent(payload && payload.caller_chat_id)) {
+function assertPublicPluginToolCaller(payload: unknown): void {
+  if (gatewayCallerIsAgent(asRecord(payload).caller_chat_id)) {
     throw new Error("collaboration, probe and gateway tools cannot be called from collaboration agent, summary or finalization contexts");
   }
 }
 
-function toolNameOf(tool) {
-  return typeof tool === "string" ? tool : String(tool && tool.name || "");
+function toolNameOf(tool: unknown): string {
+  return typeof tool === "string" ? tool : String(asRecord(tool).name || "");
 }
 
-function isAgentHiddenTool(name) {
+function isAgentHiddenTool(name: unknown): boolean {
   const toolName = String(name || "");
   return AGENT_HIDDEN_TOOL_NAMES.has(toolName) ||
-    AGENT_HIDDEN_TOOL_PREFIXES.some((prefix) => toolName.startsWith(prefix));
+    AGENT_HIDDEN_TOOL_PREFIXES.some((prefix: string) => toolName.startsWith(prefix));
 }
 
-function filterAgentTools(tools, policy, actionGate = null) {
+function filterAgentTools(
+  tools: unknown[],
+  policy: FileGatewayPolicy | undefined,
+  actionGate: RuntimeActionGate | null = null,
+): unknown[] {
   return tools.filter((tool) => {
     const name = toolNameOf(tool);
     if (isAgentHiddenTool(name)) return false;
@@ -195,14 +293,18 @@ function filterAgentTools(tools, policy, actionGate = null) {
   });
 }
 
-function agentHiddenToolNames() {
+function agentHiddenToolNames(): string[] {
   const names = [...AGENT_HIDDEN_TOOL_NAMES];
-  return names.concat(names.map((name) =>
+  return names.concat(names.map((name: string) =>
     `${name.startsWith("probe_") || name.startsWith("gateway_") ? "tool_lifecycle_probe" : "collaboration"}:${name}`
   ));
 }
 
-function gatewayDecision(currentTools, policy, actionGate = null) {
+function gatewayDecision(
+  currentTools: unknown,
+  policy: FileGatewayPolicy | undefined,
+  actionGate: RuntimeActionGate | null = null,
+): GatewayDecision {
   if (Array.isArray(currentTools)) {
     const filtered = filterAgentTools(currentTools, policy, actionGate);
     return {
@@ -229,9 +331,9 @@ function gatewayDecision(currentTools, policy, actionGate = null) {
   };
 }
 
-function parseFileGatewayTools(value, fieldName) {
+function parseFileGatewayTools(value: unknown, fieldName: string): string[] {
   if (value === undefined || value === null || value === "") return [];
-  let parsed = value;
+  let parsed: unknown = value;
   if (typeof parsed === "string") {
     try {
       parsed = JSON.parse(parsed);
@@ -245,23 +347,23 @@ function parseFileGatewayTools(value, fieldName) {
   return Array.from(new Set(parsed.map((item) => item.trim()).filter(Boolean)));
 }
 
-function registerFileGateway(agentId, config) {
+function registerFileGateway(agentId: unknown, config: unknown): void {
   const id = String(agentId || "").trim();
   if (!id) throw new Error("agent_id is required");
-  const cfg = config || {};
+  const cfg = asRecord(config);
   const allowedRaw = cfg.allowed_tools !== undefined ? cfg.allowed_tools : cfg.allowed_tools_json;
   const deniedRaw = cfg.denied_tools !== undefined ? cfg.denied_tools : cfg.denied_tools_json;
-  const allowed = new Set(parseFileGatewayTools(allowedRaw, "allowed_tools"));
-  const denied = new Set(parseFileGatewayTools(deniedRaw, "denied_tools"));
+  const allowed = new Set<string>(parseFileGatewayTools(allowedRaw, "allowed_tools"));
+  const denied = new Set<string>(parseFileGatewayTools(deniedRaw, "denied_tools"));
   fileGatewayAgents.set(id, { allowedTools: allowed, deniedTools: denied });
 }
 
-function unregisterFileGateway(agentId) {
+function unregisterFileGateway(agentId: unknown): void {
   fileGatewayAgents.delete(String(agentId || "").trim());
 }
 
 function fileGatewayStatus() {
-  const agents = {};
+  const agents: Record<string, { allowed_tools: string[]; denied_tools: string[] }> = {};
   for (const [id, config] of fileGatewayAgents) {
     agents[id] = {
       allowed_tools: [...config.allowedTools].sort(),
@@ -278,8 +380,9 @@ function fileGatewayStatus() {
   };
 }
 
-function onPromptHistory(event) {
-  const payload = event && event.eventPayload ? event.eventPayload : {};
+function onPromptHistory(event: ToolPkg.PromptHistoryHookEvent | unknown): null {
+  const eventRecord = asRecord(event);
+  const payload = asRecord(eventRecord.eventPayload);
   rememberConversationHistory(
     payload.chatId,
     payload.chatHistory,
@@ -289,9 +392,9 @@ function onPromptHistory(event) {
   return null;
 }
 
-function applyAgentGateway(agentId, currentTools, source) {
+function applyAgentGateway(agentId: string, currentTools: unknown, source: string): GatewayDecision["result"] {
   const policy = fileGatewayAgents.get(agentId);
-  const actionGate = collaboration.getActionGate(agentId);
+  const actionGate = collaboration.getActionGate(agentId) as RuntimeActionGate | null;
   const decision = gatewayDecision(currentTools, policy, actionGate);
   try {
     probeUpdateLastPromptComposeEntry({
@@ -304,10 +407,11 @@ function applyAgentGateway(agentId, currentTools, source) {
   return decision.result;
 }
 
-function onToolPromptCompose(event) {
-  const payload = event && event.eventPayload ? event.eventPayload : {};
+function onToolPromptCompose(event: ToolPkg.ToolPromptComposeHookEvent | unknown): GatewayDecision["result"] | null {
+  const eventRecord = asRecord(event);
+  const payload = asRecord(eventRecord.eventPayload);
   const chatId = String(payload.chatId || "");
-  const meta = (payload.metadata && typeof payload.metadata === "object") ? payload.metadata : {};
+  const meta = asRecord(payload.metadata);
   const proxySender = String(
     payload.proxySenderName || payload.proxy_sender_name ||
     meta.proxySenderName || meta.proxy_sender_name || ""
@@ -350,16 +454,16 @@ function onToolPromptCompose(event) {
 // Tool-lifecycle probe — ALL state lives in the main context (this file).
 // Per TOOLPKG_FORMAT_GUIDE §3.2.5, subpackage scripts run in a separate
 // "sandbox" JS context with its own globalThis; module instances and
-// top-level variables are NOT shared across contexts. globalThis bridges and
-// require()-based state sharing both fail. The correct cross-context channel
+// Top-level variables are not shared across contexts, and globalThis bridges
+// do not provide cross-context state. The correct cross-context channel
 // is ToolPkg.ipc: the probe subpackage's query tools call
 // ToolPkg.ipc.call(channel, params) which routes here (main context) where the
 // in-memory log and status live.
 const PROBE_MAX_LOG_ENTRIES = 500;
 const PROBE_AGENT_PREFIX = "CollaborationAgent:";
 const PROBE_SUMMARY_PREFIX = "CollaborationSummary:";
-const probeLog = [];
-const probeStatus = {
+const probeLog: ProbeEntry[] = [];
+const probeStatus: ProbeStatus = {
   registered: false,
   registration_error: "",
   hook_active: false,
@@ -380,10 +484,10 @@ const probeStatus = {
 };
 let probeSequence = 0;
 
-function probeReadField(payload, keys) {
-  if (!payload || typeof payload !== "object") return "";
+function probeReadField(payload: unknown, keys: string[]): string {
+  const record = asRecord(payload);
   for (const key of keys) {
-    const value = payload[key];
+    const value = record[key];
     if (value !== undefined && value !== null && String(value).length > 0) {
       return String(value);
     }
@@ -391,7 +495,7 @@ function probeReadField(payload, keys) {
   return "";
 }
 
-function probeAttributionFor(sender, chatId) {
+function probeAttributionFor(sender: unknown, chatId: unknown): ProbeAttribution {
   const source = String(sender || "");
   const id = String(chatId || "");
   if (source.startsWith(PROBE_AGENT_PREFIX)) {
@@ -413,8 +517,8 @@ function probeAttributionFor(sender, chatId) {
   return { kind: "unattributed", agent_id: "" };
 }
 
-function probeRecordAgentToolInvocation(details) {
-  const data = details || {};
+function probeRecordAgentToolInvocation(details: unknown): ProbeEntry | null {
+  const data = asRecord(details);
   const agentId = String(data.agent_id || "").trim();
   const toolName = String(data.tool_name || "").trim();
   if (!agentId || !toolName) return null;
@@ -454,11 +558,16 @@ function probeRecordAgentToolInvocation(details) {
   return entry;
 }
 
-function probeRecordEvent(eventName, eventTop, payload) {
+function probeRecordEvent(eventName: unknown, eventTop: unknown, payload: unknown): ProbeEntry {
   const timestamp = Date.now();
   // The host nests identity fields inside event.event (a sub-object).
   // Search event.event, eventTop, and payload for proxySenderName/chatId.
-  const nestedEvent = (eventTop && eventTop.event && typeof eventTop.event === "object") ? eventTop.event : null;
+  const eventRecord = asRecord(eventTop);
+  const payloadRecord = asRecord(payload);
+  const nestedEventValue = eventRecord.event;
+  const nestedEvent = nestedEventValue !== null && typeof nestedEventValue === "object"
+    ? asRecord(nestedEventValue)
+    : null;
   const toolName = probeReadField(payload, ["toolName", "tool_name", "name"]) ||
     probeReadField(eventTop, ["toolName", "tool_name", "name"]);
   const eventPhase = probeReadField(payload, ["eventName", "event_name", "phase"]);
@@ -488,10 +597,10 @@ function probeRecordEvent(eventName, eventTop, payload) {
     else senderSource = "payload";
   }
 
-  const entry = {
+  const entry: ProbeEntry = {
     seq: (probeSequence += 1),
     at: timestamp,
-    event_name: eventName || eventPhase || "unknown",
+    event_name: String(eventName || eventPhase || "unknown"),
     tool_name: toolName,
     proxy_sender_name: proxySender,
     proxy_sender_source: senderSource,
@@ -532,20 +641,38 @@ function probeRecordEvent(eventName, eventTop, payload) {
   return entry;
 }
 
-function onToolLifecycle(event) {
+function onToolLifecycle(event: ToolPkg.ToolLifecycleHookEvent | unknown): { decision: "allow" } {
   try {
-    const payload = event && event.eventPayload ? event.eventPayload : (event || {});
-    const eventName = probeReadField(event, ["eventName", "event_name"]) ||
+    const eventRecord = asRecord(event);
+    const payload = eventRecord.eventPayload === undefined
+      ? eventRecord
+      : asRecord(eventRecord.eventPayload);
+    const eventName = probeReadField(eventRecord, ["eventName", "event_name"]) ||
       probeReadField(payload, ["eventName", "event_name", "phase"]);
     probeStatus.hook_active = true;
-    probeRecordEvent(eventName, event || {}, payload);
+    const entry = probeRecordEvent(eventName, eventRecord, payload);
+    if (entry.attribution_kind === "collaboration_agent" && entry.attributed_agent_id &&
+        (entry.event_name === "tool_execution_started" ||
+         entry.event_name === "tool_execution_result" ||
+         entry.event_name === "tool_execution_error")) {
+      collaboration.recordToolLifecycle({
+        phase: entry.event_name,
+        agent_id: entry.attributed_agent_id,
+        tool_name: entry.tool_name,
+        invocation_id: entry.invocation_id,
+        success: payload.success,
+        result_text: payload.resultText,
+        result_json: payload.resultJson,
+        error_message: payload.errorMessage,
+      });
+    }
   } catch (_) {
     // Swallow: observation only, never throw from a host hook.
   }
   return { decision: "allow" };
 }
 
-function probeGetStatus(_params) {
+function probeGetStatus(_params: unknown) {
   const capabilityHookAvailable = typeof ToolPkg !== "undefined" && ToolPkg &&
     typeof ToolPkg.registerToolLifecycleHook === "function";
   const registrationState = probeStatus.registered
@@ -587,11 +714,14 @@ function probeGetStatus(_params) {
   };
 }
 
-function probeGetLog(params) {
-  const p = params || {};
-  const limit = Number.isFinite(p.limit) && p.limit > 0
-    ? Math.min(PROBE_MAX_LOG_ENTRIES, Math.floor(p.limit))
-    : Math.min(PROBE_MAX_LOG_ENTRIES, 100);
+function probeGetLog(params: unknown) {
+  const p = asRecord(params);
+  const requestedLimit = Number(p.limit);
+  const limit = Number.isInteger(requestedLimit) && requestedLimit === 0
+    ? PROBE_MAX_LOG_ENTRIES
+    : Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.min(PROBE_MAX_LOG_ENTRIES, Math.floor(requestedLimit))
+      : Math.min(PROBE_MAX_LOG_ENTRIES, 100);
   const toolFilter = String(p.tool_name || "").trim();
   const senderFilter = String(p.proxy_sender_name || "").trim();
   const interceptOnly = p.intercept_only === true;
@@ -612,7 +742,7 @@ function probeGetLog(params) {
   };
 }
 
-function probeClearLog(_params) {
+function probeClearLog(_params: unknown) {
   const lifecycleCleared = probeLog.length;
   const promptComposeCleared = promptComposeLog.length;
   probeLog.length = 0;
@@ -627,34 +757,37 @@ function probeClearLog(_params) {
 }
 
 // Record prompt-compose events to verify proxySenderName availability.
-const promptComposeLog = [];
+const promptComposeLog: PromptComposeEntry[] = [];
 const PROMPT_COMPOSE_MAX_LOG = 100;
 
-function probeRecordPromptComposeEvent(payload) {
-  const meta = (payload && payload.metadata && typeof payload.metadata === "object") ? payload.metadata : null;
-  const tools = Array.isArray(payload.availableTools) ? payload.availableTools : [];
-  const toolNames = tools.map((tool) => {
+function probeRecordPromptComposeEvent(payload: unknown): PromptComposeEntry {
+  const payloadRecord = asRecord(payload);
+  const metaValue = payloadRecord.metadata;
+  const meta = metaValue !== null && typeof metaValue === "object" ? asRecord(metaValue) : null;
+  const tools: unknown[] = Array.isArray(payloadRecord.availableTools) ? payloadRecord.availableTools : [];
+  const toolNames = tools.map((tool: unknown) => {
     if (typeof tool === "string") return tool;
-    if (tool && typeof tool === "object") return String(tool.name || tool.toolName || tool.id || "?");
+    const toolRecord = asRecord(tool);
+    if (Object.keys(toolRecord).length > 0) return String(toolRecord.name || toolRecord.toolName || toolRecord.id || "?");
     return String(tool);
   });
   const firstToolSample = tools.length > 0 ? tools[0] : null;
   const firstToolType = firstToolSample === null ? "null" : typeof firstToolSample;
   const firstToolKeys = firstToolSample && typeof firstToolSample === "object"
-    ? Object.keys(firstToolSample).sort()
+    ? Object.keys(asRecord(firstToolSample)).sort()
     : [];
-  const entry = {
+  const entry: PromptComposeEntry = {
     at: Date.now(),
-    chat_id: String(payload.chatId || payload.chat_id || ""),
-    proxy_sender_name: String(payload.proxySenderName || payload.proxy_sender_name || ""),
+    chat_id: String(payloadRecord.chatId || payloadRecord.chat_id || ""),
+    proxy_sender_name: String(payloadRecord.proxySenderName || payloadRecord.proxy_sender_name || ""),
     metadata_proxy_sender: meta ? String(meta.proxySenderName || meta.proxy_sender_name || "") : "",
     metadata_keys: meta ? Object.keys(meta).sort() : [],
-    function_type: String(payload.functionType || payload.function_type || ""),
-    prompt_function_type: String(payload.promptFunctionType || payload.prompt_function_type || ""),
-    stage: String(payload.stage || ""),
-    sub_task: String(payload.subTask || payload.sub_task || ""),
-    payload_keys: payload && typeof payload === "object" ? Object.keys(payload).sort() : [],
-    has_available_tools: Array.isArray(payload.availableTools),
+    function_type: String(payloadRecord.functionType || payloadRecord.function_type || ""),
+    prompt_function_type: String(payloadRecord.promptFunctionType || payloadRecord.prompt_function_type || ""),
+    stage: String(payloadRecord.stage || ""),
+    sub_task: String(payloadRecord.subTask || payloadRecord.sub_task || ""),
+    payload_keys: Object.keys(payloadRecord).sort(),
+    has_available_tools: Array.isArray(payloadRecord.availableTools),
     available_tools_count: tools.length,
     available_tool_names: toolNames,
     first_tool_type: firstToolType,
@@ -669,13 +802,13 @@ function probeRecordPromptComposeEvent(payload) {
   return entry;
 }
 
-function probeUpdateLastPromptComposeEntry(updates) {
+function probeUpdateLastPromptComposeEntry(updates: DynamicRecord): void {
   if (promptComposeLog.length === 0) return;
   const last = promptComposeLog[promptComposeLog.length - 1];
-  for (const k in updates) last[k] = updates[k];
+  for (const [key, value] of Object.entries(updates)) last[key] = value;
 }
 
-function probeGetPromptComposeLog(_params) {
+function probeGetPromptComposeLog(_params: unknown) {
   return {
     success: true,
     probe: "prompt_compose",
@@ -683,13 +816,13 @@ function probeGetPromptComposeLog(_params) {
     entries: promptComposeLog.slice(-50),
   };
 }
-function resolveDashboardScreen(moduleRef) {
+function resolveDashboardScreen(moduleRef: unknown): ToolPkg.ComposeDslScreen | null {
   // During ToolPkg registration, requiring a local *.ui.js returns a path-tagged
   // placeholder function. In normal CommonJS execution it returns the exports object.
-  if (typeof moduleRef === "function") return moduleRef;
-  if (!moduleRef || typeof moduleRef !== "object") return null;
-  if (typeof moduleRef.default === "function") return moduleRef.default;
-  if (typeof moduleRef.Screen === "function") return moduleRef.Screen;
+  if (typeof moduleRef === "function") return moduleRef as ToolPkg.ComposeDslScreen;
+  const exportsRecord = asRecord(moduleRef);
+  if (typeof exportsRecord.default === "function") return exportsRecord.default as ToolPkg.ComposeDslScreen;
+  if (typeof exportsRecord.Screen === "function") return exportsRecord.Screen as ToolPkg.ComposeDslScreen;
   return null;
 }
 
@@ -701,15 +834,13 @@ function registerDashboardUi() {
     return false;
   }
   try {
-    const dashboardScreen = resolveDashboardScreen(
-      require("./ui/collaboration_dashboard/index.ui.js")
-    );
+    const dashboardScreen = resolveDashboardScreen(dashboardModule);
     if (typeof dashboardScreen !== "function") {
       throw new Error("collaboration dashboard entry function is unavailable");
     }
 
     ToolPkg.registerToolboxUiModule({
-      id: "collaboration_dashboard_v101",
+      id: "collaboration_dashboard_v102",
       runtime: "compose_dsl",
       screen: dashboardScreen,
       params: {},
@@ -768,7 +899,7 @@ function registerToolPkg() {
   return true;
 }
 
-module.exports = {
+export {
   registerToolPkg,
   registerDashboardUi,
   resolveDashboardScreen,

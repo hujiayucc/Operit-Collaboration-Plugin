@@ -13,7 +13,7 @@ global.ToolPkg = {
   },
 };
 
-const api = require("../src/ui/collaboration_dashboard/api.js");
+const api = require("../dist/ui/collaboration_dashboard/api.js");
 
 test("dashboard API targets main runtime and keeps structured arrays", async () => {
   calls.length = 0;
@@ -21,7 +21,7 @@ test("dashboard API targets main runtime and keeps structured arrays", async () 
   assert.deepEqual(calls[0], {
     channel: "collaboration.spawn_agent",
     payload: { task: "write", target_paths: ["/repo/src"], read_only: false },
-    options: { targetRuntime: "main" },
+    options: undefined,
   });
 });
 
@@ -29,14 +29,17 @@ test("dashboard API maps UI-only detail, tree and history management channels", 
   calls.length = 0;
   await api.inspectAgent("agent_1");
   await api.listTree({ agent_id: "agent_1" });
+  await api.watchTreeEvents({ root_run_id: "root_1", after_revision: 0 });
   await api.deleteAgent("agent_1");
   await api.clearHistory();
   assert.equal(calls[0].channel, "collaboration.inspect_agent");
   assert.equal(calls[1].channel, "collaboration.list_tree");
-  assert.deepEqual(calls[2].payload, { agent_id: "agent_1" });
-  assert.equal(calls[2].channel, "collaboration.delete_agent");
-  assert.deepEqual(calls[3].payload, {});
-  assert.equal(calls[3].channel, "collaboration.clear_history");
+  assert.equal(calls[2].channel, "collaboration.watch_tree_events");
+  assert.deepEqual(calls[2].payload, { root_run_id: "root_1", after_revision: 0 });
+  assert.deepEqual(calls[3].payload, { agent_id: "agent_1" });
+  assert.equal(calls[3].channel, "collaboration.delete_agent");
+  assert.deepEqual(calls[4].payload, {});
+  assert.equal(calls[4].channel, "collaboration.clear_history");
 });
 
 test("dashboard API preserves localizable codes and structured failure details", async () => {

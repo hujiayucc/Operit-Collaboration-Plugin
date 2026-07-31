@@ -211,9 +211,9 @@ const {
   STATE_SCHEMA_VERSION,
   createCollaborationStore,
   memoryStore,
-} = require("../src/collaboration/store.js");
+} = require("../dist/collaboration/store.js");
 
-test("event store creates schema v3 and round-trips relational projections", () => {
+test("event store creates schema v4 and round-trips relational projections", () => {
   activeDb = createAndroidDb();
   const store = createCollaborationStore();
   assert.equal(store.mode, "sqlite");
@@ -224,7 +224,7 @@ test("event store creates schema v3 and round-trips relational projections", () 
   const snapshot = sampleSnapshot();
   store.save(snapshot);
   assert.equal(store.revision, 1);
-  assert.equal(activeDb.scalar("SELECT meta_value FROM collaboration_meta WHERE meta_key = 'schema_version'"), "3");
+  assert.equal(activeDb.scalar("SELECT meta_value FROM collaboration_meta WHERE meta_key = 'schema_version'"), "4");
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM agents"), 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM runs"), 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM run_attempts"), 1);
@@ -234,13 +234,14 @@ test("event store creates schema v3 and round-trips relational projections", () 
   assert.equal(runProjection.rootRunId, "execution_1");
   assert.equal(runProjection.treeDepth, 0);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM messages"), 1);
+  assert.equal(JSON.parse(activeDb.scalar("SELECT state_json FROM messages")).direction, "inbound");
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM events"), 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM checkpoints"), 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM path_claims WHERE active = 1"), 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM side_effects"), 0);
 
   const loaded = store.load();
-  assert.equal(loaded.schema_version, 3);
+  assert.equal(loaded.schema_version, 4);
   assert.equal(loaded.saved_at, snapshot.saved_at);
   assert.equal(loaded.revision, 1);
   assert.deepEqual(loaded.agents, snapshot.agents);
@@ -310,7 +311,7 @@ test("legacy snapshot migrates atomically without deleting the v1 source table",
 
   const store = createCollaborationStore();
   assert.equal(store.mode, "sqlite");
-  assert.equal(store.migration, "snapshot_v1_to_event_store_v3");
+  assert.equal(store.migration, "snapshot_v1_to_event_store_v4");
   assert.equal(store.revision, 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM collaboration_snapshot"), 1);
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM agents"), 1);
@@ -595,7 +596,7 @@ test("side-effect ledger rejects effects without an owning execution epoch", () 
   assert.equal(store.revision, 0);
 });
 
-test("schema v2 migrates atomically to v3 with attempt projections", () => {
+test("schema v2 migrates atomically to v4 with attempt and tree context projections", () => {
   activeDb = createAndroidDb();
   const first = createCollaborationStore();
   first.save(sampleSnapshot());
@@ -604,10 +605,30 @@ test("schema v2 migrates atomically to v3 with attempt projections", () => {
 
   const migrated = createCollaborationStore();
   assert.equal(migrated.mode, "sqlite");
-  assert.equal(migrated.migration, "event_store_v2_to_v3");
-  assert.equal(activeDb.scalar("SELECT meta_value FROM collaboration_meta WHERE meta_key = 'schema_version'"), "3");
+  assert.equal(migrated.migration, "event_store_v2_to_v4");
+  assert.equal(activeDb.scalar("SELECT meta_value FROM collaboration_meta WHERE meta_key = 'schema_version'"), "4");
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM run_attempts"), 1);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_events"), 0);
   assert.equal(activeDb.scalar("SELECT execution_epoch FROM run_attempts"), "agent_1:1:1");
+});
+
+test("schema v3 migrates atomically to v4 with empty tree context projections", () => {
+  activeDb = createAndroidDb();
+  const first = createCollaborationStore();
+  first.save(sampleSnapshot());
+  activeDb.execSQL("DROP TABLE tree_context_events");
+  activeDb.execSQL("DROP TABLE tree_context_snapshots");
+  activeDb.execSQL("DROP TABLE agent_context_cursors");
+  activeDb.execSQL("UPDATE collaboration_meta SET meta_value = '3' WHERE meta_key = 'schema_version'");
+
+  const migrated = createCollaborationStore();
+  assert.equal(migrated.mode, "sqlite");
+  assert.equal(migrated.migration, "event_store_v3_to_v4");
+  assert.equal(activeDb.scalar("SELECT meta_value FROM collaboration_meta WHERE meta_key = 'schema_version'"), "4");
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_events"), 0);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_snapshots"), 0);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM agent_context_cursors"), 0);
+  assert.equal(migrated.load().agents.length, 1);
 });
 
 test("schema v2 migration marks prepared effects unknown in the same transaction", () => {
@@ -624,7 +645,7 @@ test("schema v2 migration marks prepared effects unknown in the same transaction
   activeDb.execSQL("UPDATE collaboration_meta SET meta_value = '2' WHERE meta_key = 'schema_version'");
 
   const migrated = createCollaborationStore();
-  assert.equal(migrated.migration, "event_store_v2_to_v3_prepared_effects_marked_unknown");
+  assert.equal(migrated.migration, "event_store_v2_to_v4_prepared_effects_marked_unknown");
   assert.equal(migrated.getEffect(prepared.effect.effectKey).status, "unknown");
   assert.equal(activeDb.scalar("SELECT COUNT(*) FROM events WHERE event_type = 'effect_state_unknown'"), 1);
 });
@@ -685,7 +706,7 @@ test("stale attempts and non-terminal rewrites cannot overwrite a newer or termi
   assert.equal(activeDb.scalar("SELECT status FROM runs WHERE run_id = 'execution_1'"), "completed");
 });
 
-test("opening schema v3 marks prepared effects unknown without re-executing them", () => {
+test("opening schema v4 marks prepared effects unknown without re-executing them", () => {
   activeDb = createAndroidDb();
   const first = createCollaborationStore();
   first.save(sampleSnapshot());
@@ -800,7 +821,7 @@ test("memory event store clones state and follows attempt and effect semantics",
   store.save(snapshot);
   snapshot.agents[0].name = "external mutation";
   assert.equal(store.mode, "memory");
-  assert.equal(store.schemaVersion, 3);
+  assert.equal(store.schemaVersion, 4);
   assert.equal(store.persistenceModel, "event_store");
   assert.equal(store.revision, 1);
   assert.equal(store.load().agents[0].name, "writer");
@@ -834,6 +855,207 @@ test("memory event store clones state and follows attempt and effect semantics",
   assert.equal(store.load().agents.length, 0);
   assert.equal(store.listAttempts("execution_1").length, 0);
   assert.equal(store.getEffect(prepared.effect.effectKey), null);
+});
+
+test("tree context events are revisioned, idempotent, materialized and cursor-backed", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  assert.equal(store.schemaVersion, 4);
+  assert.equal(activeDb.scalar("SELECT meta_value FROM collaboration_meta WHERE meta_key = 'schema_version'"), "4");
+  const first = store.appendTreeContextEvent({
+    eventId: "tree_event_1",
+    rootRunId: "root_run_1",
+    sourceAgentId: "agent_parent",
+    sourceRunId: "parent_run",
+    sourceEpoch: "agent_parent:1:1",
+    kind: "checkpoint",
+    visibility: "tree",
+    payload: { step: 1, result: "parent fact" },
+    idempotencyKey: "checkpoint:parent_run:1",
+    committedAt: 100,
+  });
+  assert.equal(first.deduplicated, false);
+  assert.equal(first.event.revision, 1);
+  const duplicate = store.appendTreeContextEvent({
+    eventId: "tree_event_retry",
+    rootRunId: "root_run_1",
+    sourceAgentId: "agent_parent",
+    sourceRunId: "parent_run",
+    sourceEpoch: "agent_parent:1:1",
+    kind: "checkpoint",
+    visibility: "tree",
+    payload: { step: 1, result: "parent fact" },
+    idempotencyKey: "checkpoint:parent_run:1",
+    committedAt: 200,
+  });
+  assert.equal(duplicate.deduplicated, true);
+  assert.equal(duplicate.event.eventId, "tree_event_1");
+  assert.equal(store.revision, 1);
+  assert.throws(() => store.appendTreeContextEvent({
+    rootRunId: "root_run_1",
+    sourceAgentId: "agent_parent",
+    sourceRunId: "parent_run",
+    sourceEpoch: "agent_parent:1:1",
+    kind: "checkpoint",
+    visibility: "tree",
+    payload: { step: 1, result: "conflict" },
+    idempotencyKey: "checkpoint:parent_run:1",
+  }), /idempotency collision/);
+
+  store.saveAgentContextCursor({
+    rootRunId: "root_run_1",
+    agentId: "agent_sibling",
+    lastAppliedRevision: 0,
+    dirtyRevision: 0,
+    updatedAt: 110,
+  });
+  const second = store.appendTreeContextEvent({
+    eventId: "tree_event_2",
+    rootRunId: "root_run_1",
+    sourceAgentId: "agent_child",
+    sourceRunId: "child_run",
+    sourceEpoch: "agent_child:1:1",
+    kind: "decision",
+    visibility: "tree",
+    payload: { text: "child decision" },
+    idempotencyKey: "decision:child_run:1",
+    committedAt: 120,
+  });
+  assert.equal(second.event.revision, 3);
+  assert.deepEqual(store.listTreeContextEvents("root_run_1", first.event.revision).map((event) => event.eventId), ["tree_event_2"]);
+  assert.equal(store.listTreeContextEvents("other_root", 0).length, 0);
+  assert.equal(store.getTreeContextSnapshot("root_run_1").revision, second.event.revision);
+  assert.deepEqual(store.getTreeContextSnapshot("root_run_1").events.map((event) => event.eventId), ["tree_event_1", "tree_event_2"]);
+  assert.equal(store.getAgentContextCursor("root_run_1", "agent_sibling").dirtyRevision, second.event.revision);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_events"), 2);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_snapshots"), 1);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM agent_context_cursors"), 1);
+
+  const reopened = createCollaborationStore();
+  assert.equal(reopened.getTreeContextSnapshot("root_run_1").revision, second.event.revision);
+  assert.equal(reopened.getAgentContextCursor("root_run_1", "agent_sibling").dirtyRevision, second.event.revision);
+  reopened.close();
+});
+
+test("tree context and Agent checkpoint projections commit atomically", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  const snapshot = sampleSnapshot();
+  store.save(snapshot);
+  const changed = structuredClone(snapshot.agents[0]);
+  changed.executions[0].checkpoints.push({
+    step: 2,
+    result: "atomic checkpoint",
+    diagnostics: {},
+    evidence: null,
+    createdAt: 300,
+  });
+  changed.executions[0].stepCount = 2;
+  const committed = store.appendTreeContextEvent({
+    eventId: "atomic_checkpoint_event",
+    rootRunId: changed.executions[0].rootRunId || changed.executions[0].id,
+    sourceAgentId: changed.id,
+    sourceRunId: changed.executions[0].id,
+    sourceEpoch: changed.executions[0].epoch,
+    kind: "checkpoint",
+    payload: { step: 2, result: "atomic checkpoint" },
+    idempotencyKey: `checkpoint:${changed.executions[0].id}:2`,
+    committedAt: 300,
+  }, { changedAgents: [changed] });
+  assert.equal(committed.checkpoint.treeContextRevision, committed.event.revision);
+  assert.equal(JSON.parse(activeDb.scalar("SELECT checkpoint_json FROM checkpoints WHERE step = 2")).treeContextRevision, committed.event.revision);
+  assert.equal(store.load().agents[0].executions[0].checkpoints.at(-1).treeContextRevision, committed.event.revision);
+
+  const rollback = structuredClone(changed);
+  rollback.name = "must roll back with tree context";
+  rollback.executions[0].checkpoints.push({
+    step: 3,
+    result: "rollback checkpoint",
+    diagnostics: {},
+    evidence: null,
+    createdAt: 400,
+  });
+  const revision = store.revision;
+  activeDb.setFailure((sql) => sql.includes("atomic_rollback_event"));
+  assert.throws(() => store.appendTreeContextEvent({
+    eventId: "atomic_rollback_event",
+    rootRunId: rollback.executions[0].rootRunId || rollback.executions[0].id,
+    sourceAgentId: rollback.id,
+    sourceRunId: rollback.executions[0].id,
+    sourceEpoch: rollback.executions[0].epoch,
+    kind: "checkpoint",
+    payload: { step: 3, result: "rollback checkpoint" },
+    idempotencyKey: `checkpoint:${rollback.executions[0].id}:3`,
+    committedAt: 400,
+  }, { changedAgents: [rollback] }), /injected SQLite failure/);
+  activeDb.setFailure(null);
+  assert.equal(store.revision, revision);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM checkpoints WHERE step = 3"), 0);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_events WHERE event_id = 'atomic_rollback_event'"), 0);
+  assert.equal(JSON.parse(activeDb.scalar("SELECT state_json FROM agents WHERE agent_id = 'agent_1'")).name, "writer");
+});
+
+test("tree context event transaction rolls back event, snapshot, cursor and revision together", () => {
+  activeDb = createAndroidDb();
+  const store = createCollaborationStore();
+  store.saveAgentContextCursor({
+    rootRunId: "rollback_root",
+    agentId: "rollback_agent",
+    lastAppliedRevision: 0,
+    dirtyRevision: 0,
+    updatedAt: 100,
+  });
+  const revision = store.revision;
+  activeDb.setFailure((sql) => sql.startsWith("INSERT OR REPLACE INTO tree_context_snapshots"));
+  assert.throws(() => store.appendTreeContextEvent({
+    eventId: "rollback_tree_event",
+    rootRunId: "rollback_root",
+    sourceAgentId: "source_agent",
+    sourceRunId: "source_run",
+    sourceEpoch: "source_agent:1:1",
+    kind: "checkpoint",
+    payload: { result: "must roll back" },
+    idempotencyKey: "checkpoint:source_run:1",
+  }), /injected SQLite failure/);
+  activeDb.setFailure(null);
+  assert.equal(store.revision, revision);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_events"), 0);
+  assert.equal(activeDb.scalar("SELECT COUNT(*) FROM tree_context_snapshots"), 0);
+  assert.equal(store.getAgentContextCursor("rollback_root", "rollback_agent").dirtyRevision, 0);
+});
+
+test("memory event store mirrors tree context revision, snapshot and cursor semantics", () => {
+  const store = memoryStore("SQLite unavailable");
+  const first = store.appendTreeContextEvent({
+    eventId: "memory_tree_event",
+    rootRunId: "memory_root",
+    sourceAgentId: "memory_agent",
+    sourceRunId: "memory_run",
+    sourceEpoch: "memory_agent:1:1",
+    kind: "fact",
+    payload: { fact: "persisted in memory" },
+    idempotencyKey: "fact:memory:1",
+  });
+  store.saveAgentContextCursor({
+    rootRunId: "memory_root",
+    agentId: "memory_consumer",
+    lastAppliedRevision: first.event.revision,
+    dirtyRevision: first.event.revision,
+    updatedAt: 200,
+  });
+  assert.equal(store.listTreeContextEvents("memory_root", 0).length, 1);
+  assert.equal(store.getTreeContextSnapshot("memory_root").events[0].payload.fact, "persisted in memory");
+  assert.equal(store.getAgentContextCursor("memory_root", "memory_consumer").lastAppliedRevision, first.event.revision);
+  const duplicate = store.appendTreeContextEvent({
+    rootRunId: "memory_root",
+    sourceAgentId: "memory_agent",
+    sourceRunId: "memory_run",
+    sourceEpoch: "memory_agent:1:1",
+    kind: "fact",
+    payload: { fact: "persisted in memory" },
+    idempotencyKey: "fact:memory:1",
+  });
+  assert.equal(duplicate.deduplicated, true);
 });
 
 test("event store reports why SQLite is unavailable", () => {

@@ -3,8 +3,8 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { allowedActions, mergeAgents } = require("../src/ui/collaboration_dashboard/model.js");
-const { fingerprint, generateRequestId, markRequest, nextRequest } = require("../src/ui/collaboration_dashboard/request-id.js");
+const { allowedActions, mergeAgents } = require("../dist/ui/collaboration_dashboard/model.js");
+const { fingerprint, generateRequestId, markRequest, nextRequest } = require("../dist/ui/collaboration_dashboard/request-id.js");
 
 test("dashboard operation matrix follows collaboration states", () => {
   assert.deepEqual(allowedActions("queued"), { message: true, wait: true, followup: false, interrupt: true });

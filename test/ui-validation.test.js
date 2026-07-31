@@ -9,7 +9,7 @@ const {
   parseTargetPaths,
   validateFollowup,
   validateSpawn,
-} = require("../src/ui/collaboration_dashboard/validation.js");
+} = require("../dist/ui/collaboration_dashboard/validation.js");
 
 test("dashboard path parsing trims, filters and deduplicates", () => {
   assert.deepEqual(parseTargetPaths("/repo/src\n\n/repo/src\n/repo/test"), ["/repo/src", "/repo/test"]);
@@ -30,6 +30,7 @@ test("spawn validation enforces explicit write paths", () => {
     workspace_path: "/repo",
   };
   assert.equal(validateSpawn({ ...base, read_only: true, target_paths_text: "/other" }).valid, true);
+  assert.equal(validateSpawn({ ...base, read_only: true, timeout_ms: 0, max_tool_calls: 0 }).valid, true);
   assert.equal(validateSpawn({ ...base, read_only: true, max_tool_calls: 64 }).valid, true);
   assert.match(validateSpawn({ ...base, read_only: true, max_tool_calls: 65 }).errors.join(","), /max_tool_calls_invalid/);
   assert.match(validateSpawn({ ...base, read_only: false, target_paths_text: "" }).errors.join(","), /write_paths_required/);

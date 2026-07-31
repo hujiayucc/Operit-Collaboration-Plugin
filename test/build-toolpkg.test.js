@@ -10,29 +10,72 @@ const test = require("node:test");
 const root = path.resolve(__dirname, "..");
 const buildPath = path.join(root, "scripts/build-toolpkg.js");
 const { spawnSync } = require("node:child_process");
-const { MANIFEST, OUT, PROJECT_NAME, ROOT, RUNTIME_FILES, metadataPrefix, snapshotSources, verifyStage } = require(buildPath);
+const {
+  MANIFEST,
+  OUT,
+  PROJECT_NAME,
+  ROOT,
+  RUNTIME_FILES,
+  RUNTIME_SOURCE_FILES,
+  compiledRuntimePath,
+  metadataPrefix,
+  minifyManifest,
+  singleLineJavaScript,
+  snapshotSources,
+  verifyStage,
+} = require(buildPath);
 
 function sha256(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+function packageMetadata(file) {
+  const sourceFile = fs.existsSync(path.join(root, file)) ? file : file.replace(/\.js$/, ".ts");
+  const source = fs.readFileSync(path.join(root, sourceFile), "utf8");
+  const match = source.match(/\/\* METADATA\s*([\s\S]*?)\*\//);
+  assert.ok(match, `missing source METADATA for ${file}`);
+  return JSON.parse(match[1]);
+}
+
+function metadataToolNames(file) {
+  return packageMetadata(file).tools.map((tool) => tool.name);
+}
+
 test("ToolPkg build script preserves the explicit runtime package manifest", () => {
-  assert.equal(RUNTIME_FILES.length, 22);
+  assert.equal(RUNTIME_FILES.length, 18);
   assert.equal(new Set(RUNTIME_FILES).size, RUNTIME_FILES.length);
   assert.equal(RUNTIME_FILES.includes("manifest.json"), true);
-  assert.equal(RUNTIME_FILES.includes("src/main.js"), true);
-  assert.equal(RUNTIME_FILES.includes("README.md"), true);
-  assert.equal(RUNTIME_FILES.includes("README.zh-CN.md"), true);
+  for (const excluded of ["LICENSE", "README.md", "README.zh-CN.md", "tsconfig.json"]) {
+    assert.equal(RUNTIME_FILES.includes(excluded), false);
+  }
+  assert.equal(RUNTIME_FILES.includes("dist/main.js"), true);
+  assert.equal(RUNTIME_FILES.some((file) => file.startsWith("src/") && file.endsWith(".js")), false);
+  assert.equal(RUNTIME_FILES.some((file) => file.startsWith("src/") && file.endsWith(".ts")), false);
+  assert.equal(compiledRuntimePath("dist/main.js"), "dist/main.js");
+  for (const module of ["api", "components", "i18n", "model", "request-id", "validation"]) {
+    assert.equal(RUNTIME_FILES.includes(`dist/ui/collaboration_dashboard/${module}.js`), true);
+    assert.equal(RUNTIME_SOURCE_FILES.includes(`src/ui/collaboration_dashboard/${module}.ts`), true);
+    assert.equal(RUNTIME_SOURCE_FILES.includes(`src/ui/collaboration_dashboard/${module}.js`), false);
+  }
+  for (const module of ["protocol", "collaboration/helpers", "collaboration/model", "collaboration/store", "packages/collaboration", "packages/tool_lifecycle_probe"]) {
+    assert.equal(RUNTIME_FILES.includes(`dist/${module}.js`), true);
+    assert.equal(RUNTIME_SOURCE_FILES.includes(`src/${module}.ts`), true);
+    assert.equal(RUNTIME_SOURCE_FILES.includes(`src/${module}.js`), false);
+  }
   assert.equal(RUNTIME_FILES.some((file) => file.startsWith("test/")), false);
   assert.equal(RUNTIME_FILES.some((file) => file.startsWith("prompts/")), false);
   for (const file of RUNTIME_FILES) {
-    assert.equal(fs.existsSync(path.join(root, file)), true, `missing runtime file: ${file}`);
+    assert.equal(fs.existsSync(path.join(root, compiledRuntimePath(file))), true, `missing runtime source: ${file}`);
+  }
+  for (const file of RUNTIME_SOURCE_FILES) {
+    assert.equal(fs.existsSync(path.join(root, file)), true, `missing TypeScript runtime source: ${file}`);
   }
 });
 
-test("English and Chinese READMEs keep user-facing runtime facts synchronized", () => {
+test("English and Chinese READMEs stay concise and synchronized", () => {
   const english = fs.readFileSync(path.join(root, "README.md"), "utf8");
   const chinese = fs.readFileSync(path.join(root, "README.zh-CN.md"), "utf8");
+  const semanticVersion = /\bv?\d+\.\d+\.\d+\b/;
   assert.equal(english.startsWith("<div align=\"center\">"), true);
   assert.equal(chinese.startsWith("<div align=\"center\">"), true);
   assert.match(english, new RegExp(`# ${MANIFEST.display_name.en}`));
@@ -41,67 +84,57 @@ test("English and Chinese READMEs keep user-facing runtime facts synchronized", 
   assert.match(chinese, /\[项目仓库\]\(https:\/\/github\.com\/hujiayucc\/Operit-Collaboration-Plugin\)/);
   assert.match(english, /\*\*English \| \[简体中文\]\(README\.zh-CN\.md\)\*\*/);
   assert.match(chinese, /\*\*\[English\]\(README\.md\) \| 简体中文\*\*/);
-  assert.match(english, /SQLite.*in-memory fallback/is);
-  assert.match(chinese, /SQLite 不可用时回退到内存/);
-  assert.match(english, /Global active Runs.*1 to 16.*default 6.*Per-root.*1 to 8.*default 3/is);
-  assert.match(chinese, /全局活动 Run 上限可配置为 1–16，默认 6；单根任务树活动槽可配置为 1–8，默认 3/);
-  assert.match(english, /max_model_retries.*0 to 12.*defaults to 5.*Balance.*not retried/is);
-  assert.match(chinese, /max_model_retries.*0–12.*默认 5.*余额不足.*不重试/s);
-  assert.match(english, /message_acks.*only parent message IDs.*actually processed/is);
-  assert.match(chinese, /message_acks.*只包含实际处理.*不得编造 ID/s);
-  assert.match(english, /timeout_ms.*integer.*30000.*3600000.*timeout_invalid/is);
-  assert.match(chinese, /timeout_ms.*30000.*3600000.*整数.*timeout_invalid/s);
-  assert.match(english, /new prompt-compose stage.*already assembled.*read_file.*edit_file.*read_file/is);
-  assert.match(chinese, /新的 prompt-compose 阶段.*已经组装的工具列表.*不会.*重新组合/s);
-  assert.match(english, /per-invocation enforcement.*host lifecycle-intercept capability/is);
-  assert.match(chinese, /逐工具执行前.*宿主 lifecycle intercept/);
-  for (const phrase of [
-    "attribution_capability",
-    "no_events_observed",
-    "host_identity_fields_observed",
-    "host_identity_fields_missing",
-    "runtime_agent_callbacks_observed",
-    "host_lifecycle_events",
-    "host_identity_bearing_events",
-    "runtime_attributed_events",
-    "active_without_local_registration",
-    "total_events",
-    "default_denied_tools",
-    "fixed_hidden_tools",
-    "execution_guard",
-  ]) {
-    assert.ok(english.includes(phrase), `English README missing probe/gateway fact: ${phrase}`);
-    assert.ok(chinese.includes(phrase), `Chinese README missing probe/gateway fact: ${phrase}`);
+  assert.doesNotMatch(english, semanticVersion);
+  assert.doesNotMatch(chinese, semanticVersion);
+  assert.ok(english.length < 10000, "English README should remain concise");
+  assert.ok(chinese.length < 6000, "Chinese README should remain concise");
+  assert.ok(english.split(/\r?\n/).length <= 140, "English README has too many lines");
+  assert.ok(chinese.split(/\r?\n/).length <= 140, "Chinese README has too many lines");
+
+  const collaborationTools = metadataToolNames("src/packages/collaboration.js");
+  assert.equal(collaborationTools.length, 13);
+  assert.match(english, /Thirteen collaboration and control tools/);
+  assert.match(chinese, /十三个协作与控制工具/);
+  for (const tool of collaborationTools) {
+    assert.ok(english.includes(`\`${tool}\``), `English README missing collaboration tool: ${tool}`);
+    assert.ok(chinese.includes(`\`${tool}\``), `Chinese README missing collaboration tool: ${tool}`);
   }
-  assert.match(english, /dynamically activating a package.*IPC execution guard|IPC execution guard.*dynamically activating a package/is);
-  assert.match(chinese, /动态激活包.*IPC 执行守卫|IPC 执行守卫.*动态激活包/s);
-  assert.match(english, /summary uses the same stream network-idle timeout as its Run/is);
-  assert.match(chinese, /摘要使用与所属 Run 相同的流网络空闲超时/s);
-  assert.match(english, /does not infer identity from tool names, timing, or the most recent conversation/i);
-  assert.match(chinese, /工具名、时间邻近或最近会话推测归因/);
-  assert.match(english, /absent or fixed-hidden.*task\/context.*authoritative source/is);
-  assert.match(chinese, /当前不可见或固定隐藏.*任务\/context 明示契约.*权威源文件/s);
-  assert.match(english, /Mark missing evidence as unverified.*memory/is);
-  assert.match(chinese, /资料不足时标记为未验证.*不得凭记忆补全或宣称已核验/s);
-  assert.match(english, /file read-back proves only persisted content.*external API name.*parameter schema.*runtime behavior/is);
-  assert.match(chinese, /文件读回只证明实际落盘内容和持久性.*不能证明外部接口名.*参数 schema.*运行时行为正确/s);
-  assert.match(english, /## System Prompt Templates/);
-  assert.match(chinese, /## 系统提示词列表/);
+  assert.match(english, /SQLite Event Store schema v4.*in-memory fallback/is);
+  assert.match(chinese, /SQLite Event Store schema v4.*SQLite 不可用时.*回退到内存/s);
+  assert.match(english, /Global active Runs.*0.*unlimited.*1.*16.*Active Runs per root.*0.*unlimited.*1.*8/is);
+  assert.match(chinese, /全局活动 Run.*0.*不限.*1.*16.*单根任务树活动 Run.*0.*不限.*1.*8/s);
+  assert.match(english, /max_model_retries.*-1.*unlimited.*0.*12.*Balance.*not retried/is);
+  assert.match(chinese, /max_model_retries.*-1.*不限.*0.*12.*余额不足.*不重试/s);
+  assert.match(english, /message_acks.*Only IDs actually processed/is);
+  assert.match(chinese, /message_acks.*只应确认实际处理过的 ID/s);
+  assert.match(english, /timeout_ms.*0.*unlimited.*integer.*30000.*3600000.*timeout_invalid/is);
+  assert.match(chinese, /timeout_ms.*0.*不限.*30000.*3600000.*整数.*timeout_invalid/s);
+  assert.match(english, /max_tool_calls.*0.*unlimited.*1.*64/is);
+  assert.match(chinese, /max_tool_calls.*0.*不限.*1.*64/s);
+  assert.match(english, /outbound_messages.*main_messages/is);
+  assert.match(chinese, /outbound_messages.*main_messages/s);
+  assert.match(english, /IPC execution guard/);
+  assert.match(chinese, /IPC 执行守卫/);
+
   for (const file of [
-    "prompts/prompt-full-zh.md",
-    "prompts/prompt-full-en.md",
-    "prompts/prompt-read-only-zh.md",
-    "prompts/prompt-read-only-en.md",
+    "prompt-full-zh.md",
+    "prompt-full-en.md",
+    "prompt-read-only-zh.md",
+    "prompt-read-only-en.md",
+    "prompt-mini-zh.md",
+    "prompt-mini-en.md",
   ]) {
     assert.ok(english.includes(`\`${file}\``), `English README missing system prompt template: ${file}`);
     assert.ok(chinese.includes(`\`${file}\``), `Chinese README missing system prompt template: ${file}`);
   }
-  assert.match(english, /archive includes both README files/);
-  assert.match(chinese, /安装包包含英文 `README\.md` 和中文 `README\.zh-CN\.md`/);
-  assert.match(english, /builder does not package `prompts\/`/);
-  assert.match(chinese, /不会把 `prompts\/` 目录打进 ToolPkg/);
-  assert.match(english, /neither README nor the source prompt templates are automatically read or injected/i);
-  assert.match(chinese, /两份 README 和上述模板不会被运行时自动读取或注入/);
+  assert.match(english, /archive contains only runtime files and a single-line `manifest\.json`/i);
+  assert.match(english, /Compiled JavaScript is stored under `dist\/` in the archive.*TypeScript source files are excluded/i);
+  assert.match(chinese, /安装包仅包含运行时文件和单行 `manifest\.json`/);
+  assert.match(chinese, /已编译 JavaScript.*安装包的 `dist\/` 目录.*TypeScript 源文件不会入包/);
+  assert.match(english, /TypeScript source files are excluded.*`prompts\/`/i);
+  assert.match(chinese, /TypeScript 源文件不会入包.*`prompts\/`.*不会入包/);
+  assert.match(english, /Neither the README files nor these source templates are automatically read or injected/i);
+  assert.match(chinese, /两份 README 和这些源码模板不会被运行时自动读取或注入/);
 });
 
 test("system prompt templates keep collaboration decisions and runtime facts aligned", () => {
@@ -111,6 +144,8 @@ test("system prompt templates keep collaboration decisions and runtime facts ali
     "prompts/prompt-read-only-zh.md",
     "prompts/prompt-read-only-en.md",
   ];
+  const collaborationTools = metadataToolNames("src/packages/collaboration.js");
+  assert.equal(collaborationTools.length, 13);
   const unrestrictedPrefixEnd = "BEGIN.\n\n";
   const availableTemplates = templates.filter((file) => fs.existsSync(path.join(root, file)));
   if (availableTemplates.length === 0) {
@@ -166,13 +201,16 @@ test("system prompt templates keep collaboration decisions and runtime facts ali
     assert.ok(source.includes("GPT/Operit jailbreak"), `${file} missing Codex-to-Operit replacement`);
     assert.equal(source.includes("Codex"), false, `${file} retains Codex`);
     assert.ok(source.indexOf(unrestrictedPrefixEnd) > 0, `${file} missing priority-prefix terminator`);
+    for (const toolName of collaborationTools) {
+      assert.ok(source.includes(`\`${toolName}\``), `${file} missing public collaboration tool: ${toolName}`);
+    }
     assert.match(source, /协作收益|collaboration benefit/i, `${file} missing collaboration benefit gate`);
     assert.match(source, /1(?:\s*(?:–|-|to)\s*)16/i, `${file} missing configurable 1-16 global limit`);
     assert.match(source, /1(?:\s*(?:–|-|to)\s*)8/i, `${file} missing configurable 1-8 per-root limit`);
     assert.match(source, /max_model_retries/i, `${file} missing model retry setting`);
     assert.match(source, /0(?:\s*(?:–|-|to)\s*)12/i, `${file} missing configurable 0-12 model retry range`);
     assert.match(source, /余额不足|insufficient balance/i, `${file} missing non-retryable balance boundary`);
-    assert.match(source, /SQLite Event Store schema v3/i, `${file} missing persistence model`);
+    assert.match(source, /SQLite Event Store schema v4/i, `${file} missing persistence model`);
     assert.match(source, /回退到内存|falls back to memory/i, `${file} missing memory fallback`);
     assert.match(source, /persistence: "memory"/i, `${file} missing fallback response marker`);
     assert.match(source, /message_acks/i, `${file} missing message acknowledgements`);
@@ -211,14 +249,8 @@ test("mini system prompt templates match the public ToolPkg contract without inv
     return;
   }
   assert.equal(miniFiles.every((file) => fs.existsSync(path.join(root, file))), true);
-  const collaborationTools = [
-    "spawn_agent",
-    "list_agents",
-    "send_message",
-    "followup_task",
-    "wait_agent",
-    "interrupt_agent",
-  ];
+  const collaborationTools = metadataToolNames("src/packages/collaboration.js");
+  assert.equal(collaborationTools.length, 13);
   const probeTools = [
     "probe_get_status",
     "probe_get_log",
@@ -259,7 +291,7 @@ test("mini system prompt templates match the public ToolPkg contract without inv
     assert.match(source, /max_tool_calls/);
     assert.match(source, /max_model_retries/);
     assert.match(source, /0(?:\s*(?:–|-|to)\s*)12/i);
-    assert.match(source, /SQLite Event Store schema v3/i);
+    assert.match(source, /SQLite Event Store schema v4/i);
     assert.match(source, /persistence\s*=\s*memory/i);
     assert.match(source, /COLLABORATION_CONTROL/);
     assert.match(source, /execution_epoch/);
@@ -272,14 +304,7 @@ test("mini system prompt templates match the public ToolPkg contract without inv
 });
 
 test("ToolPkg build keeps every public plugin tool hidden from collaboration agents", () => {
-  function metadataToolNames(file) {
-    const source = fs.readFileSync(path.join(root, file), "utf8");
-    const match = source.match(/\/\* METADATA\s*([\s\S]*?)\*\//);
-    assert.ok(match, `missing source METADATA for ${file}`);
-    return JSON.parse(match[1]).tools.map((tool) => tool.name);
-  }
-
-  const mainSource = fs.readFileSync(path.join(root, "src/main.js"), "utf8");
+  const mainSource = fs.readFileSync(path.join(root, "src/main.ts"), "utf8");
   const hiddenSetMatch = mainSource.match(/(?:const\s+)?AGENT_HIDDEN_TOOL_NAMES\s*=\s*new Set\(\[([\s\S]*?)\]\)/);
   assert.ok(hiddenSetMatch, "missing AGENT_HIDDEN_TOOL_NAMES declaration");
   const hiddenNames = new Set(Array.from(
@@ -297,7 +322,12 @@ test("ToolPkg build keeps every public plugin tool hidden from collaboration age
 test("ToolPkg build script derives project and output paths dynamically", () => {
   assert.equal(ROOT, root);
   assert.equal(PROJECT_NAME, path.basename(root));
-  assert.equal(MANIFEST.version, "1.0.1");
+  assert.equal(MANIFEST.version, "1.0.2");
+  assert.equal(MANIFEST.main, "dist/main.js");
+  assert.deepEqual(MANIFEST.subpackages.map((subpackage) => subpackage.entry), [
+    "dist/packages/collaboration.js",
+    "dist/packages/tool_lifecycle_probe.js",
+  ]);
   assert.equal(OUT, path.join(root, `${path.basename(root)}-v${MANIFEST.version}.toolpkg`));
   assert.equal(path.dirname(OUT), root);
 });
@@ -306,12 +336,12 @@ test("ToolPkg build script derives project and output paths dynamically", () => 
 test("ToolPkg build without --replace skips an existing archive with exit code zero", () => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "operit-build-existing-output-"));
   const fixtureScript = path.join(fixtureRoot, "scripts", "build-toolpkg.js");
-  const fixtureOutput = path.join(fixtureRoot, `${path.basename(fixtureRoot)}-v1.0.1.toolpkg`);
+  const fixtureOutput = path.join(fixtureRoot, `${path.basename(fixtureRoot)}-v1.0.2.toolpkg`);
   const archive = Buffer.from("existing-toolpkg-fixture");
   try {
     fs.mkdirSync(path.dirname(fixtureScript), { recursive: true });
     fs.copyFileSync(buildPath, fixtureScript);
-    fs.writeFileSync(path.join(fixtureRoot, "manifest.json"), JSON.stringify({ version: "1.0.1" }));
+    fs.writeFileSync(path.join(fixtureRoot, "manifest.json"), JSON.stringify({ version: "1.0.2" }));
     fs.writeFileSync(fixtureOutput, archive);
     const result = spawnSync(process.execPath, [fixtureScript], {
       cwd: fixtureRoot,
@@ -333,6 +363,24 @@ test("ToolPkg build without --replace skips an existing archive with exit code z
 });
 
 
+test("ToolPkg stage manifest is minified without changing its data", () => {
+  const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "operit-build-manifest-minify-"));
+  const source = fs.readFileSync(path.join(root, "manifest.json"), "utf8");
+  const sourceHash = sha256(path.join(root, "manifest.json"));
+  try {
+    fs.writeFileSync(path.join(stageRoot, "manifest.json"), source);
+    minifyManifest(stageRoot);
+    const output = fs.readFileSync(path.join(stageRoot, "manifest.json"), "utf8");
+    assert.equal(output, JSON.stringify(JSON.parse(source)));
+    assert.doesNotMatch(output, /[\r\n]/);
+    assert.deepEqual(JSON.parse(output), JSON.parse(source));
+    assert.equal(sha256(path.join(root, "manifest.json")), sourceHash);
+  } finally {
+    fs.rmSync(stageRoot, { recursive: true, force: true });
+  }
+});
+
+
 test("ToolPkg stage version follows manifest.json", () => {
   const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "operit-build-version-test-"));
   const originalVersion = MANIFEST.version;
@@ -340,7 +388,7 @@ test("ToolPkg stage version follows manifest.json", () => {
     for (const file of RUNTIME_FILES) {
       const destination = path.join(stageRoot, file);
       fs.mkdirSync(path.dirname(destination), { recursive: true });
-      fs.copyFileSync(path.join(root, file), destination);
+      fs.copyFileSync(path.join(root, compiledRuntimePath(file)), destination);
     }
     const stagedManifest = JSON.parse(fs.readFileSync(path.join(stageRoot, "manifest.json"), "utf8"));
     stagedManifest.version = `${originalVersion}-next`;
@@ -357,8 +405,42 @@ test("ToolPkg stage version follows manifest.json", () => {
 });
 
 
+test("ToolPkg JavaScript transformation compresses without mangling names", () => {
+  const stageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "operit-build-js-compressed-"));
+  const target = path.join(stageRoot, "dist", "main.js");
+  const source = [
+    '"use strict";',
+    "class RetainedClass {}",
+    "function retainedFunction(retainedParameter) {",
+    "  const retainedLocal = retainedParameter + 1;",
+    "  if (false) return 99;",
+    "  return retainedLocal;",
+    "}",
+    "function intentionallyUnused() { return 7; }",
+    "module.exports = { RetainedClass, retainedFunction, intentionallyUnused };",
+  ].join("\n");
+  try {
+    for (const file of RUNTIME_FILES.filter((item) => item.endsWith(".js"))) {
+      const fixture = path.join(stageRoot, file);
+      fs.mkdirSync(path.dirname(fixture), { recursive: true });
+      fs.writeFileSync(fixture, file === "dist/main.js" ? source : "module.exports = {};");
+    }
+    singleLineJavaScript(stageRoot);
+    const output = fs.readFileSync(target, "utf8");
+    assert.doesNotMatch(output, /[\r\n]/);
+    assert.match(output, /class RetainedClass/);
+    assert.match(output, /function retainedFunction\(retainedParameter\)/);
+    assert.match(output, /function intentionallyUnused\(\)/);
+    assert.match(output, /module\.exports/);
+    assert.doesNotMatch(output, /retainedLocal|if\(false\)|return 99/);
+  } finally {
+    fs.rmSync(stageRoot, { recursive: true, force: true });
+  }
+});
+
+
 test("ToolPkg build preserves parseable METADATA as a single-line prefix", () => {
-  for (const file of ["src/packages/collaboration.js", "src/packages/tool_lifecycle_probe.js"]) {
+  for (const file of ["src/packages/collaboration.ts", "src/packages/tool_lifecycle_probe.ts"]) {
     const source = fs.readFileSync(path.join(root, file), "utf8");
     const sourceMatch = source.match(/\/\* METADATA\s*([\s\S]*?)\*\//);
     assert.ok(sourceMatch, `missing source METADATA for ${file}`);
@@ -376,21 +458,27 @@ test("ToolPkg build preserves parseable METADATA as a single-line prefix", () =>
 });
 
 
-test("ToolPkg build script source snapshot is stable without invoking minification", () => {
+test("ToolPkg build script source snapshot is stable with conservative compression", () => {
   const before = snapshotSources();
   const scriptHash = sha256(buildPath);
   const after = snapshotSources();
   assert.deepEqual(after, before);
   assert.equal(sha256(buildPath), scriptHash);
   const source = fs.readFileSync(buildPath, "utf8");
+  assert.match(source, /execFileSync\("npm", \["run", "compile"\]/);
+  assert.doesNotMatch(source, /typescript@|TYPESCRIPT_VERSION/);
   assert.match(source, /const TERSER_VERSION = "5\.31\.6"/);
   assert.match(source, /`terser@\$\{TERSER_VERSION\}`/);
-  assert.match(source, /--keep-fnames/);
-  assert.match(source, /--keep-classnames/);
-  assert.doesNotMatch(source, /"--mangle"/);
-  assert.match(source, /source JS changed during package build/);
-  assert.match(source, /minified stage regression failed/);
-  assert.match(source, /minified JavaScript must be exactly one non-empty line/);
+  assert.match(source, /"--compress"/);
+  assert.match(source, /"passes=2,unsafe=false,toplevel=false"/);
+  assert.match(source, /"--no-rename"/);
+  assert.match(source, /"--keep-fnames"/);
+  assert.match(source, /"--keep-classnames"/);
+  assert.match(source, /"comments=false,beautify=false"/);
+  assert.doesNotMatch(source, /"--mangle"|mangle-properties/);
+  assert.match(source, /runtime source changed during package build/);
+  assert.match(source, /single-line stage regression failed/);
+  assert.match(source, /JavaScript must be exactly one non-empty line/);
   assert.match(source, /output already exists; use --replace to rebuild it/);
   assert.match(source, /path\.resolve\(__dirname, "\.\."\)/);
   assert.match(source, /path\.join\(ROOT, `\$\{PROJECT_NAME\}-v\$\{MANIFEST\.version\}\.toolpkg`\)/);

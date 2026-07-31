@@ -8,23 +8,32 @@ const test = require("node:test");
 const root = path.resolve(__dirname, "..");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
 
+function sourcePath(relativePath) {
+  const sourceRelative = relativePath.startsWith("dist/")
+    ? `src/${relativePath.slice("dist/".length)}`
+    : relativePath;
+  if (sourceRelative.endsWith(".js")) {
+    const typeScriptRelative = sourceRelative.slice(0, -3) + ".ts";
+    if (fs.existsSync(path.join(root, typeScriptRelative))) return typeScriptRelative;
+  }
+  return sourceRelative;
+}
+
 function metadataFor(relativePath) {
-  const source = fs.readFileSync(path.join(root, relativePath), "utf8");
+  const source = fs.readFileSync(path.join(root, sourcePath(relativePath)), "utf8");
   const match = source.match(/\/\* METADATA\s*([\s\S]*?)\*\//);
   assert.ok(match, `missing METADATA in ${relativePath}`);
   return JSON.parse(match[1]);
 }
 
 function exportedFunctionNames(relativePath) {
-  const source = fs.readFileSync(path.join(root, relativePath), "utf8");
-  const match = source.match(/module\.exports\s*=\s*\{([\s\S]*?)\};/);
-  assert.ok(match, `missing module.exports in ${relativePath}`);
-  return match[1]
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .filter((value) => !NON_TOOL_EXPORTS.has(value))
-    .sort();
+  const source = fs.readFileSync(path.join(root, sourcePath(relativePath)), "utf8");
+  const commonJs = source.match(/module\.exports\s*=\s*\{([\s\S]*?)\};/);
+  const names = commonJs
+    ? commonJs[1].split(",").map((value) => value.trim()).filter(Boolean)
+    : Array.from(source.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/g), (match) => match[1]);
+  assert.ok(names.length > 0, `missing exported functions in ${relativePath}`);
+  return names.filter((value) => !NON_TOOL_EXPORTS.has(value)).sort();
 }
 
 // Exports that are host lifecycle hooks rather than user-callable tools. The
@@ -33,7 +42,7 @@ function exportedFunctionNames(relativePath) {
 const NON_TOOL_EXPORTS = new Set(["onToolLifecycle"]);
 
 test("subpackage metadata matches manifest and exported tools", () => {
-  assert.equal(manifest.version, "1.0.1");
+  assert.equal(manifest.version, "1.0.2");
   for (const subpackage of manifest.subpackages) {
     const metadata = metadataFor(subpackage.entry);
     assert.equal(metadata.name, subpackage.id);
@@ -76,6 +85,7 @@ test("AI-facing metadata documents global budgets and gateway precedence", () =>
     assert.match(`${parameter.description.zh} ${parameter.description.en}`, /全局|global/i);
     assert.match(`${parameter.description.zh} ${parameter.description.en}`, /覆盖|overridden/i);
     assert.match(`${parameter.description.zh} ${parameter.description.en}`, /1.?64|1-64/);
+    assert.match(`${parameter.description.zh} ${parameter.description.en}`, /0.*不限|0.*unlimited/i);
     const context = tool.parameters.find((item) => item.name === "context");
     const contextText = `${context.description.zh} ${context.description.en}`;
     assert.match(contextText, /不可见|absent/i);
@@ -107,8 +117,8 @@ test("package metadata states critical runtime limits", () => {
   const listText = `${list.description.zh} ${list.description.en}`;
   assert.match(collaborationText, /SQLite/);
   assert.match(collaborationText, /Event Store/);
-  assert.match(collaborationText, /schema v3/i);
-  assert.match(manifestText, /schema v3/i);
+  assert.match(collaborationText, /schema v4/i);
+  assert.match(manifestText, /schema v4/i);
   assert.match(collaborationText, /幂等|idempotency/i);
   assert.match(collaborationText, /execution.?epoch|epoch/i);
   assert.match(collaborationText, /1.?16|one to sixteen|1 to 16/i);

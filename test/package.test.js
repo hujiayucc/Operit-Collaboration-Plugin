@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { classifyErrorCode, toolFailure } = require("../src/protocol.js");
+const { classifyErrorCode, toolFailure } = require("../dist/protocol.js");
 
 const calls = [];
 global.ToolPkg = {
@@ -14,7 +14,7 @@ global.ToolPkg = {
   },
 };
 
-const collaboration = require("../src/packages/collaboration.js");
+const collaboration = require("../dist/packages/collaboration.js");
 
 test("classifies structured operation errors for black-box callers", () => {
   assert.equal(classifyErrorCode("request_id conflict: duplicate"), "request_id_conflict");
@@ -22,7 +22,7 @@ test("classifies structured operation errors for black-box callers", () => {
   assert.equal(classifyErrorCode("agent_ids must be a non-empty array"), "agent_ids_invalid");
   assert.equal(classifyErrorCode("target path is outside workspace: /tmp/output"), "path_outside_workspace");
   assert.equal(classifyErrorCode("workspace_env must be android or linux"), "workspace_env_invalid");
-  assert.equal(classifyErrorCode("timeout_ms must be an integer between 30000 and 3600000"), "timeout_invalid");
+  assert.equal(classifyErrorCode("timeout_ms must be 0 (unlimited) or an integer between 30000 and 3600000"), "timeout_invalid");
   assert.equal(classifyErrorCode("max_model_retries must be an integer between 0 and 12"), "max_model_retries_invalid");
   assert.equal(classifyErrorCode("agent agent_1 is completed; use followup_task to start a new run"), "agent_state_invalid");
   assert.equal(classifyErrorCode("task is required"), "parameter_required");
@@ -49,7 +49,7 @@ test("spawn_agent returns a structured object and forwards the parent chat id", 
   assert.equal(calls.at(-1).payload.request_id, "spawn-request-1");
   assert.equal(calls.at(-1).payload.parent_chat_id, "chat_1");
   assert.equal(calls.at(-1).payload.include_conversation_context, true);
-  assert.deepEqual(calls.at(-1).options, { targetRuntime: "main" });
+  assert.equal(calls.at(-1).options, undefined);
 });
 
 test("all collaboration package calls forward the injected caller chat id", async () => {
@@ -125,4 +125,41 @@ test("forwards pagination and request ids for all write tools", async () => {
 
   await collaboration.interrupt_agent({ agent_id: "agent_1", request_id: "interrupt-1" });
   assert.equal(calls.at(-1).payload.request_id, "interrupt-1");
+});
+
+test("forwards Dashboard control tools through the public collaboration package", async () => {
+  calls.length = 0;
+  await collaboration.inspect_agent({ agent_id: "agent_1" });
+  await collaboration.list_tree({ agent_id: "agent_1" });
+  await collaboration.watch_tree_events({ root_run_id: "run_root_1", after_revision: 4, limit: 25 });
+  await collaboration.get_settings({});
+  await collaboration.update_settings({
+    max_concurrent_agents: 4,
+    max_active_runs_per_root: 2,
+    max_tool_calls: 12,
+    max_model_retries: 3,
+    conversation_context_mode: "on",
+  });
+  await collaboration.delete_agent({ agent_id: "agent_1" });
+  await collaboration.clear_history({});
+
+  assert.deepEqual(calls.map((call) => call.channel), [
+    "collaboration.inspect_agent",
+    "collaboration.list_tree",
+    "collaboration.watch_tree_events",
+    "collaboration.get_settings",
+    "collaboration.update_settings",
+    "collaboration.delete_agent",
+    "collaboration.clear_history",
+  ]);
+  assert.deepEqual(calls[2].payload, { root_run_id: "run_root_1", after_revision: 4, limit: 25, caller_chat_id: "" });
+  assert.deepEqual(calls[4].payload, {
+    max_concurrent_agents: 4,
+    max_active_runs_per_root: 2,
+    max_tool_calls: 12,
+    max_model_retries: 3,
+    conversation_context_mode: "on",
+    caller_chat_id: "",
+  });
+  for (const call of calls) assert.equal(call.options, undefined);
 });

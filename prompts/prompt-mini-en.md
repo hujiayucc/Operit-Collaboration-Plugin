@@ -4,18 +4,25 @@
 
 Use multi-Agent collaboration when a task has independent parallel subtasks, multiple modules or sources, isolated contexts, background tracking, or separate implementation and verification work. Keep short serial work in the main Agent when delegation adds no material benefit.
 
-Every delegated task must state its objective, scope, first executable action, completed and remaining actions, completion criteria, and verification. Set the contract fields needed for that Run: `context`, `include_conversation_context`, `workspace_env`, `workspace_path`, `target_paths_json`, `read_only`, `priority`, `timeout_ms`, and `max_tool_calls`. `timeout_ms` is the host AI response stream's network-idle timeout: it measures only the wait for the first or next output chunk, while continuous output has no total-generation deadline. Read-only work uses `read_only: true` with no write paths. Writable work uses `read_only: false` and a minimal non-empty `target_paths_json` of absolute paths inside `workspace_path`; these declarations guide scheduling and prompts but are not operating-system isolation. Avoid concurrent writers on overlapping paths.
+Every delegated task must state its objective, scope, first executable action, completed and remaining actions, completion criteria, and verification. Set the contract fields needed for that Run: `context`, `include_conversation_context`, `workspace_env`, `workspace_path`, `target_paths_json`, `read_only`, `priority`, `timeout_ms`, and `max_tool_calls`. `timeout_ms` is the host AI response stream's network-idle timeout: `0` means unlimited; otherwise use an integer from 30000 through 3600000. It measures only the wait for the first or next output chunk, while continuous output has no total-generation deadline. The global `max_tool_calls` setting accepts 1-64, with `0` meaning unlimited. Read-only work uses `read_only: true` with no write paths. Writable work uses `read_only: false` and a minimal non-empty `target_paths_json` of absolute paths inside `workspace_path`; these declarations guide scheduling and prompts but are not operating-system isolation. Avoid concurrent writers on overlapping paths.
 
 Transient host AI failures are retried according to global `max_model_retries`, configurable from 0 to 12 with default 5. Network, rate-limit, timeout, and temporary service failures retry; insufficient balance, authentication, parameter, context-limit, and policy errors do not. If tools may have run before a failed request, the next request verifies target state with read/search tools before any repeated mutation.
 
-## Six collaboration tools
+## Thirteen collaboration tools
 
 - `spawn_agent`: create and queue a stable logical Agent and its first Run; queued delivery is not completion.
 - `list_agents`: inspect Agents, current Runs, parent/root relationships, tree state, messages, controls, diagnostics, and optional clipped results.
 - `send_message`: queue a parent update for an active Agent; delivered is host acceptance, while acknowledged requires a processed `message_acks` entry.
 - `followup_task`: create the next Run for a terminal Agent while retaining its `agent_id` and using a new execution epoch; use `send_message` for active Agents.
-- `wait_agent`: use a non-empty `agent_ids_json` to select Agents and wait for all of them to become terminal; a wait timeout reports current state and does not cancel work.
+- `wait_agent`: use a non-empty `agent_ids_json` to select Agents and wait for all of them to become terminal; `timeout_ms` defaults to 12000, 1000-12000 is a finite wait, and `0` waits without a deadline; a finite timeout reports current state and does not cancel work.
 - `interrupt_agent`: request cancellation of the current Run and its active descendants; confirm the terminal state because issued host calls may return late.
+- `inspect_agent`: query one Agent by `agent_id`, including its current Run, messages, control state, and task-tree information.
+- `list_tree`: list task-tree nodes rooted at the Agent selected by `agent_id`.
+- `watch_tree_events`: long-poll task-tree events for `root_run_id`; `after_revision` selects later increments and `limit` bounds one response.
+- `get_settings`: read the current global collaboration scheduler settings.
+- `update_settings`: update global and per-root active-Run limits, `max_tool_calls`, `max_model_retries`, and `conversation_context_mode`.
+- `delete_agent`: delete a terminal Agent and its history by `agent_id`; active Agents are not deletable.
+- `clear_history`: clear history for all terminal Agents.
 
 Use current tool definitions and METADATA as the authority for parameters. `request_id` provides retry idempotency for `spawn_agent`, `send_message`, `followup_task`, and `interrupt_agent`; reuse a key only for the same logical request. Global active Runs are configurable from 1 to 16 (default 6), per-root active slots from 1 to 8 (default 3), and the per-root limit must not exceed the global limit; tree depth is at most 8, and one parent Run may have at most 12 direct children.
 
@@ -35,7 +42,7 @@ When committed checkpoints leave a concrete scoped mutation pending, only `edit_
 
 The main Agent tracks dispatched work with `wait_agent` or `list_agents`, then independently rereads artifacts, checks current state, or runs focused validation. Report Run state and side-effect state separately. Before retrying an unclear write, interrupt, registration, or remote action, verify whether the side effect already occurred. Isolate late results from stale execution epochs.
 
-Agents, Runs, messages, events, and checkpoints prefer SQLite Event Store schema v3. Tool responses report `persistence = memory` when SQLite is unavailable; memory state and diagnostic buffers do not survive restart. Ordinary host-tool side effects are not universally idempotent.
+Agents, Runs, messages, events, checkpoints, tree context, and Agent cursors prefer SQLite Event Store schema v4. Tool responses report `persistence = memory` when SQLite is unavailable; memory state and diagnostic buffers do not survive restart. Ordinary host-tool side effects are not universally idempotent.
 
 ## Seven lifecycle probe and gateway tools
 

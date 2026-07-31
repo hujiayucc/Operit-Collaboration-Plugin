@@ -1,7 +1,16 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
+
+function metadataToolNames(file) {
+  const source = fs.readFileSync(path.resolve(__dirname, "..", file), "utf8");
+  const match = source.match(/\/\* METADATA\s*([\s\S]*?)\*\//);
+  assert.ok(match, `missing source METADATA for ${file}`);
+  return JSON.parse(match[1]).tools.map((tool) => tool.name);
+}
 
 // The probe state lives in main.js (main context). Per TOOLPKG_FORMAT_GUIDE
 // §3.2.5, subpackage scripts run in a separate sandbox context with its own
@@ -56,7 +65,7 @@ global.ToolPkg = {
   },
 };
 
-const main = require("../src/main.js");
+const main = require("../dist/main.js");
 const initialProbeStatus = main.probeGetStatus({});
 assert.equal(initialProbeStatus.attribution_capability, "no_events_observed");
 assert.equal(initialProbeStatus.attribution_available, false);
@@ -271,7 +280,7 @@ test("subpackage forwards queries via ToolPkg.ipc to main context", async () => 
   // main.js already registered PROBE_* IPC handlers at load time via the
   // global.ToolPkg.ipc stub above. The subpackage tools call ToolPkg.ipc.call
   // which routes to those handlers in the same (test) context.
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const subStatus = await sub.probe_get_status({});
   const mainStatus = main.probeGetStatus({});
   assert.equal(typeof subStatus, "object");
@@ -280,7 +289,7 @@ test("subpackage forwards queries via ToolPkg.ipc to main context", async () => 
 });
 
 test("probe query tools return structured IPC errors", async () => {
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const originalCall = global.ToolPkg.ipc.call;
   global.ToolPkg.ipc.call = () => { throw new Error("IPC unavailable"); };
   try {
@@ -358,14 +367,8 @@ test("onToolPromptCompose hides plugin tools even without an agent policy", () =
 });
 
 test("onToolPromptCompose keeps all public plugin tools fixed-hidden from agents", () => {
-  const collaborationTools = [
-    "spawn_agent",
-    "list_agents",
-    "send_message",
-    "followup_task",
-    "wait_agent",
-    "interrupt_agent",
-  ];
+  const collaborationTools = metadataToolNames("src/packages/collaboration.ts");
+  assert.equal(collaborationTools.length, 13);
   const probeTools = [
     "probe_get_status",
     "probe_get_log",
@@ -439,7 +442,7 @@ test("onToolPromptCompose records prompt compose events for diagnostics", () => 
 });
 
 test("dynamic package activation cannot execute fixed-hidden plugin tools from Agent contexts", async () => {
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const blocked = await sub.gateway_status({
     __operit_package_chat_id: "collaboration_agent:dynamic_package_caller",
   });
@@ -455,7 +458,7 @@ test("dynamic package activation cannot execute fixed-hidden plugin tools from A
 });
 
 test("gateway tools return structured errors without mutating policies", async () => {
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const missingRegister = await sub.gateway_register({ agent_id: "", allowed_tools_json: '["read_file"]' });
   const missingUnregister = await sub.gateway_unregister({ agent_id: "" });
   const malformed = await sub.gateway_register({ agent_id: "agent_bad_json", allowed_tools_json: "not-json" });
@@ -475,7 +478,7 @@ test("gateway tools return structured errors without mutating policies", async (
 });
 
 test("gateway hides plugin tools and enforces allowlist fail-closed", async () => {
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const agentId = "agent_gateway_precedence";
   const registered = await sub.gateway_register({
     agent_id: agentId,
@@ -500,7 +503,7 @@ test("gateway hides plugin tools and enforces allowlist fail-closed", async () =
 });
 
 test("agent and summary contexts cannot mutate gateway policies", async () => {
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const agentId = "agent_gateway_write_guard";
   const normal = await sub.gateway_register({ agent_id: agentId, denied_tools_json: JSON.stringify(["delete_file"]) });
   assert.equal(normal.success, true);
@@ -520,7 +523,7 @@ test("agent and summary contexts cannot mutate gateway policies", async () => {
 });
 
 test("subpackage forwards gateway queries via ToolPkg.ipc", async () => {
-  const sub = require("../src/packages/tool_lifecycle_probe.js");
+  const sub = require("../dist/packages/tool_lifecycle_probe.js");
   const agentId = "agent_test_gateway_ipc";
   await sub.gateway_register({ agent_id: agentId, allowed_tools_json: JSON.stringify(["read_file"]) });
   const status = await sub.gateway_status({});

@@ -1,0 +1,22 @@
+{
+  "name": "operit-collaboration-plugin",
+  "version": "1.0.2",
+  "private": true,
+  "description": "Multi-agent collaboration orchestrator ToolPkg for Operit.",
+  "type": "commonjs",
+  "scripts": {
+    "check:migration": "node scripts/check-ts-migration.js",
+    "compile": "npm run check:migration && node node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "npm run check:migration && node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+    "test": "npm run compile && node --test test/*.test.js",
+    "build": "node scripts/build-toolpkg.js",
+    "build:replace": "node scripts/build-toolpkg.js --replace"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "GPL-3.0-only"
+}

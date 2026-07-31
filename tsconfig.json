@@ -5,7 +5,9 @@
     "rootDir": "./src",
     "outDir": "./dist",
     "lib": ["es2020"],
+    "allowJs": false,
     "declaration": false,
+    "noEmitOnError": true,
     "strict": true,
     "noImplicitAny": true,
     "strictNullChecks": true,
@@ -19,7 +21,7 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": [
-    "./src/**/*.ts",
+    "./src/**/*",
     "./types/**/*.d.ts"
   ],
   "exclude": [

@@ -1,4 +1,19 @@
-"use strict";
+type DynamicValue = unknown;
+type DynamicRecord = Record<string, DynamicValue>;
+type ResultRow = { label: unknown; value: unknown; tone: string };
+type MarkdownBlock = {
+  type: string;
+  text?: string;
+  marker?: string;
+  level?: number;
+  language?: string;
+};
+
+function asRecord(value: unknown): DynamicRecord {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as DynamicRecord
+    : {};
+}
 
 // Compose DSL runtime dependencies are intentionally inlined: loading another
 // script from this entry makes the host treat that script as a render entry.
@@ -11,13 +26,13 @@ const CHANNELS = Object.freeze({
   INTERRUPT_AGENT: "collaboration.interrupt_agent",
   INSPECT_AGENT: "collaboration.inspect_agent",
   LIST_TREE: "collaboration.list_tree",
+  WATCH_TREE_EVENTS: "collaboration.watch_tree_events",
   GET_SETTINGS: "collaboration.get_settings",
   UPDATE_SETTINGS: "collaboration.update_settings",
   DELETE_AGENT: "collaboration.delete_agent",
   CLEAR_HISTORY: "collaboration.clear_history",
 });
 
-const IPC_OPTIONS = Object.freeze({ targetRuntime: "main" });
 const TERMINAL_STATUSES = new Set([
   "completed",
   "failed",
@@ -51,8 +66,65 @@ const STATUS_FILTER_ROWS = Object.freeze([
   ["cancelling", "completed"],
   ["failed", "interrupted"],
   ["interrupted_with_late_result"],
-  ["timed_out"],
+  ["timed_out", "orphaned"],
 ]);
+const TOOLPKG_UPDATE = Object.freeze({
+  packageId: "com.operit.collaboration_orchestrator",
+  targetDir: "/sdcard/Android/data/com.ai.assistance.operit/files/packages",
+  action: "com.ai.assistance.operit.DEBUG_INSTALL_TOOLPKG",
+  component: "com.ai.assistance.operit/.core.tools.packTool.ToolPkgDebugInstallReceiver",
+});
+
+function pickedFileName(fileValue: DynamicValue): string {
+  const file = asRecord(fileValue);
+  for (const candidateValue of [file.name, file.path, file.uri]) {
+    const candidate = String(candidateValue || "").trim().split(/[?#]/, 1)[0];
+    if (!candidate) continue;
+    const segments = candidate.split(/[\\/]/);
+    const name = segments[segments.length - 1];
+    if (name) return name;
+  }
+  return "";
+}
+
+function isToolPkgArchive(fileValue: DynamicValue): boolean {
+  return /\.toolpkg$/i.test(pickedFileName(fileValue));
+}
+
+function buildToolPkgUpdatePayload(fileValue: DynamicValue, timestamp = Date.now()): DynamicRecord {
+  const file = asRecord(fileValue);
+  const safeTimestamp = Number.isSafeInteger(timestamp) && timestamp >= 0 ? timestamp : Date.now();
+  return {
+    source_path: String(file.path || "").trim(),
+    source_name: String(file.name || pickedFileName(file)).trim(),
+    source_size: typeof file.size === "number" ? file.size : null,
+    target_path: `${TOOLPKG_UPDATE.targetDir}/${TOOLPKG_UPDATE.packageId}-${safeTimestamp}.toolpkg`,
+  };
+}
+
+function buildToolPkgCopyParams(payloadValue: DynamicValue): DynamicRecord {
+  const payload = asRecord(payloadValue);
+  return {
+    source: String(payload.source_path || ""),
+    destination: String(payload.target_path || ""),
+    recursive: "false",
+    source_environment: "android",
+    dest_environment: "android",
+  };
+}
+
+function buildToolPkgBroadcastParams(payloadValue: DynamicValue): DynamicRecord {
+  const payload = asRecord(payloadValue);
+  return {
+    action: TOOLPKG_UPDATE.action,
+    component: TOOLPKG_UPDATE.component,
+    extras: {
+      package_name: TOOLPKG_UPDATE.packageId,
+      file_path: String(payload.target_path || ""),
+      reset_subpackage_states: true,
+    },
+  };
+}
 
 const TEXT = {
   zh: {
@@ -64,6 +136,7 @@ const TEXT = {
     loadMore: "加载更多",
     allStatuses: "全部状态",
     active: "活动",
+    running: "运行中",
     queued: "排队",
     total: "总计",
     noAgents: "暂无 Agent",
@@ -102,18 +175,26 @@ const TEXT = {
     timeoutMs: "流网络空闲超时（毫秒）",
     globalSettings: "全局运行设置",
     maxConcurrentAgents: "全局最大并发 Agent 数",
-    maxConcurrentAgentsHint: "范围 1–16；降低后不会中断正在运行的 Agent，只限制后续启动。",
+    maxConcurrentAgentsHint: "范围 1–16；0 表示不限。降低后不会中断正在运行的 Agent，只限制后续启动。",
     maxActiveRunsPerRoot: "单根任务树并发上限",
-    maxActiveRunsPerRootHint: "范围 1–8，且不高于全局并发数；降低后只限制后续启动。",
+    maxActiveRunsPerRootHint: "范围 1–8；0 表示不限。有限值不得高于有限的全局并发数。",
     maxToolCalls: "全局工具调用数",
-    maxToolCallsHint: "范围 1–64；统一应用到所有新运行，属于 Agent 提示预算。",
+    maxToolCallsHint: "范围 1–64；0 表示不限。统一应用到所有新运行，属于 Agent 提示预算。",
     maxModelRetries: "AI 调用重试次数",
-    maxModelRetriesHint: "范围 0–12，默认 5；仅重试网络、限流和服务临时异常，余额、认证、参数和策略错误直接结束。",
-    conversationContext: "传递当前对话上下文",
-    conversationContextHint: "仅复制最近的用户/助手对话，不包含系统提示和工具轨迹；自动模式由调用 AI 决定，控制台直接创建时不传递。",
+    maxModelRetriesHint: "范围 0–12；-1 表示不限，0 表示禁用重试，默认 5。仅重试网络、限流和服务临时异常。",
+    conversationContext: "共享主对话上下文",
+    conversationContextHint: "每个检查点从同一主会话引用读取最新的用户/助手历史，不保存 Run 创建时快照；系统提示和工具轨迹不共享。自动模式由调用 AI 决定。",
     conversationContextOptions: { off: "关闭", on: "开启", auto: "自动" },
     saveSettings: "保存全局设置",
     settingsSaved: "全局设置已保存",
+    packageUpdate: "更新当前 ToolPkg",
+    packageUpdateHint: "选择 .toolpkg 安装包。确认后会复制到宿主包目录并请求重载；当前控制台可能立即关闭。",
+    choosePackage: "选择安装包",
+    packageSelected: "已选择安装包",
+    packageUpdateWarning: "将更新当前 ToolPkg，宿主重载可能立即结束此控制台和正在进行的插件调用。请先完成需要保留的操作。",
+    packageUpdateSubmitting: "正在复制安装包…",
+    packageUpdateRequested: "更新请求已提交；宿主将在后台完成安装和重载",
+    packagePickerCancelled: "已取消选择安装包",
     statusFilter: "状态筛选",
     statusOptions: {
       "": "全部状态",
@@ -185,13 +266,13 @@ const TEXT = {
       sha256: "SHA-256",
     },
     events: "最近事件",
+    liveOutput: "实时输出",
+    streamRevision: "上下文版本",
     taskTree: "任务树",
     permissions: "权限",
     messageBody: "消息内容",
     permissionMode: "权限模式",
     readOnlyToggle: "强制只读",
-    showResult: "显示结果",
-    hideResult: "隐藏结果",
     recentEventsEmpty: "暂无最近事件",
     eventTypes: {
       agent_created: "Agent 已创建",
@@ -226,6 +307,13 @@ const TEXT = {
       action_gate_activated: "动作门已激活",
       action_gate_released: "动作门已解除",
       action_gate_blocked: "动作门已阻断工具",
+      model_delta: "AI 输出片段",
+      model_stream_started: "AI 流已开始",
+      model_stream_ended: "AI 流已结束",
+      model_stream_recovered_interrupted: "AI 流恢复中断",
+      tool_result: "工具结果已提交",
+      tree_context_broadcast: "上下文已广播",
+      tree_context_refresh_scheduled: "上下文刷新已安排",
     },
     eventFields: {
       status: "状态",
@@ -272,11 +360,11 @@ const TEXT = {
       task_required: "任务不能为空",
       workspace_env_invalid: "工作区环境必须为 android 或 linux",
       priority_invalid: "优先级无效",
-      timeout_invalid: "超时必须在 30000–3600000 毫秒",
-      max_tool_calls_invalid: "全局工具调用数必须为 1–64 的整数",
-      max_concurrent_agents_invalid: "全局并发 Agent 数必须为 1–16 的整数",
-      max_active_runs_per_root_invalid: "单根任务树并发上限必须为 1–8 的整数，且不高于全局并发数",
-      max_model_retries_invalid: "AI 调用重试次数必须为 0–12 的整数",
+      timeout_invalid: "超时必须为 0（不限）或 30000–3600000 毫秒",
+      max_tool_calls_invalid: "全局工具调用数必须为 0（不限）或 1–64 的整数",
+      max_concurrent_agents_invalid: "全局并发 Agent 数必须为 0（不限）或 1–16 的整数",
+      max_active_runs_per_root_invalid: "单根任务树并发上限必须为 0（不限）或 1–8 的整数，有限值不得高于有限的全局并发数",
+      max_model_retries_invalid: "AI 调用重试次数必须为 -1（不限）或 0–12 的整数",
       conversation_context_mode_invalid: "对话上下文模式必须为关闭、开启或自动",
       write_paths_required: "可写任务必须至少声明一个目标路径",
       path_not_absolute: "目标路径必须为绝对路径",
@@ -284,6 +372,9 @@ const TEXT = {
       workspace_not_absolute: "工作区路径必须为绝对路径",
       permission_mode_invalid: "权限模式无效",
       agent_required: "缺少 Agent",
+      package_file_invalid: "请选择 .toolpkg 安装包",
+      package_file_path_missing: "宿主没有返回可复制的安装包路径",
+      package_update_unsupported: "当前宿主缺少 ToolPkg 更新所需的文件选择或工具调用能力",
       ipc_invalid_response: "IPC 响应格式无效",
       operation_failed: "操作失败",
 
@@ -298,6 +389,7 @@ const TEXT = {
     loadMore: "Load more",
     allStatuses: "All statuses",
     active: "Active",
+    running: "Running",
     queued: "Queued",
     total: "Total",
     noAgents: "No agents",
@@ -336,18 +428,26 @@ const TEXT = {
     timeoutMs: "Stream network idle timeout (ms)",
     globalSettings: "Global runtime settings",
     maxConcurrentAgents: "Global maximum concurrent Agents",
-    maxConcurrentAgentsHint: "Range 1–16; lowering this does not interrupt running Agents and only limits new starts.",
+    maxConcurrentAgentsHint: "Range 1-16; 0 is unlimited. Lowering this does not interrupt running Agents and only limits new starts.",
     maxActiveRunsPerRoot: "Per-root task-tree concurrency",
-    maxActiveRunsPerRootHint: "Range 1–8 and no higher than global concurrency; lowering it only limits new starts.",
+    maxActiveRunsPerRootHint: "Range 1-8; 0 is unlimited. A finite value cannot exceed finite global concurrency.",
     maxToolCalls: "Global tool calls",
-    maxToolCallsHint: "Range 1–64; applied to every new Run as an Agent prompt budget.",
+    maxToolCallsHint: "Range 1-64; 0 is unlimited. Applied to every new Run as an Agent prompt budget.",
     maxModelRetries: "AI call retries",
-    maxModelRetriesHint: "Range 0–12, default 5. Only network, rate-limit, and temporary service failures are retried; balance, authentication, parameter, and policy errors stop immediately.",
-    conversationContext: "Pass current conversation context",
-    conversationContextHint: "Copies only recent user/assistant turns, excluding system prompts and tool traces. Auto is decided by the calling AI; dashboard-created Agents do not include it in Auto mode.",
+    maxModelRetriesHint: "Range 0-12; -1 is unlimited, 0 disables retries, default 5. Only network, rate-limit, and temporary service failures are retried.",
+    conversationContext: "Share main conversation context",
+    conversationContextHint: "Every checkpoint reads the latest user/assistant history through the same main-chat reference instead of storing a Run-creation snapshot. System prompts and tool traces are excluded. Auto is decided by the calling AI.",
     conversationContextOptions: { off: "Off", on: "On", auto: "Auto" },
     saveSettings: "Save global settings",
     settingsSaved: "Global settings saved",
+    packageUpdate: "Update current ToolPkg",
+    packageUpdateHint: "Choose a .toolpkg archive. Confirmation copies it to the host package directory and requests a reload; this dashboard may close immediately.",
+    choosePackage: "Choose package",
+    packageSelected: "Selected package",
+    packageUpdateWarning: "This updates the current ToolPkg. Host reload may immediately end this dashboard and in-flight plugin calls. Finish any work you need to retain first.",
+    packageUpdateSubmitting: "Copying the package…",
+    packageUpdateRequested: "Update request submitted; the host will install and reload it in the background",
+    packagePickerCancelled: "Package selection cancelled",
     statusFilter: "Status filter",
     statusOptions: {
       "": "All statuses",
@@ -419,13 +519,13 @@ const TEXT = {
       sha256: "SHA-256",
     },
     events: "Recent events",
+    liveOutput: "Live output",
+    streamRevision: "Context revision",
     taskTree: "Task tree",
     permissions: "Permissions",
     messageBody: "Message",
     permissionMode: "Permission mode",
     readOnlyToggle: "Force read-only",
-    showResult: "Show result",
-    hideResult: "Hide result",
     recentEventsEmpty: "No recent events",
     eventTypes: {
       agent_created: "Agent created",
@@ -460,6 +560,13 @@ const TEXT = {
       action_gate_activated: "Action gate activated",
       action_gate_released: "Action gate released",
       action_gate_blocked: "Action gate blocked tools",
+      model_delta: "AI output chunk",
+      model_stream_started: "AI stream started",
+      model_stream_ended: "AI stream ended",
+      model_stream_recovered_interrupted: "AI stream recovered as interrupted",
+      tool_result: "Tool result committed",
+      tree_context_broadcast: "Context broadcast",
+      tree_context_refresh_scheduled: "Context refresh scheduled",
     },
     eventFields: {
       status: "Status",
@@ -506,11 +613,11 @@ const TEXT = {
       task_required: "Task is required",
       workspace_env_invalid: "Workspace environment must be android or linux",
       priority_invalid: "Priority is invalid",
-      timeout_invalid: "Timeout must be between 30000 and 3600000 ms",
-      max_tool_calls_invalid: "Global tool calls must be an integer between 1 and 64",
-      max_concurrent_agents_invalid: "Global concurrent Agents must be an integer between 1 and 16",
-      max_active_runs_per_root_invalid: "Per-root concurrency must be an integer between 1 and 8 and no higher than global concurrency",
-      max_model_retries_invalid: "AI call retries must be an integer between 0 and 12",
+      timeout_invalid: "Timeout must be 0 (unlimited) or 30000-3600000 ms",
+      max_tool_calls_invalid: "Global tool calls must be 0 (unlimited) or an integer between 1 and 64",
+      max_concurrent_agents_invalid: "Global concurrent Agents must be 0 (unlimited) or an integer between 1 and 16",
+      max_active_runs_per_root_invalid: "Per-root concurrency must be 0 (unlimited) or an integer between 1 and 8; a finite value cannot exceed finite global concurrency",
+      max_model_retries_invalid: "AI call retries must be -1 (unlimited) or an integer between 0 and 12",
       conversation_context_mode_invalid: "Conversation context mode must be Off, On, or Auto",
       write_paths_required: "Writable tasks require at least one target path",
       path_not_absolute: "Target paths must be absolute",
@@ -518,14 +625,47 @@ const TEXT = {
       workspace_not_absolute: "Workspace path must be absolute",
       permission_mode_invalid: "Permission mode is invalid",
       agent_required: "Agent is required",
+      package_file_invalid: "Choose a .toolpkg archive",
+      package_file_path_missing: "The host did not return a package path that can be copied",
+      package_update_unsupported: "This host is missing the file picker or tool-call support required for ToolPkg updates",
       ipc_invalid_response: "Invalid IPC response",
       operation_failed: "Operation failed",
     },
   },
 };
 
-function resolveText(ctx) {
-  let language = "zh";
+type DashboardText = typeof TEXT.zh;
+type DashboardAgent = DynamicRecord & {
+  id: string;
+  name?: string;
+  status?: string;
+  priority?: string;
+  execution?: DynamicRecord;
+  run_seq?: number;
+  read_only?: boolean;
+  pending_messages?: number;
+  delivered_messages?: number;
+  acknowledged_messages?: number;
+  target_paths?: string[];
+  workspace_path?: string;
+  workspace_env?: string;
+  result?: DynamicValue;
+  error?: DynamicValue;
+  recent_events?: DynamicRecord[];
+};
+type DashboardSummary = { active: number; running: number; queued: number; total: number; counts: DynamicRecord };
+type RequestEntry = { requestId: string; fingerprint: string; status: string };
+type RequestLedger = Record<string, RequestEntry | null>;
+type ConfirmAction = { kind: string; payload: DynamicRecord; warning: string; returnView?: string };
+type ValidationResult = { valid: boolean; errors: string[]; target_paths?: string[]; read_only?: boolean };
+type StateValue<T> = { value: T; set: (value: T) => void };
+type AllowedActions = { message: boolean; wait: boolean; followup: boolean; interrupt: boolean };
+type PageHeaderTitle = { back?: string; label: string };
+type UiContext = ToolPkg.ComposeDslContext;
+type UiNode = ToolPkg.ComposeNode;
+
+function resolveText(ctx: UiContext): DashboardText {
+  let language: keyof typeof TEXT = "zh";
   try {
     const locale = String(ctx && typeof ctx.getEnv === "function" ? ctx.getEnv("LANG") || "" : "").toLowerCase();
     if (locale.startsWith("en")) language = "en";
@@ -533,7 +673,7 @@ function resolveText(ctx) {
   return TEXT[language];
 }
 
-function runtime() {
+function runtime(): ToolPkg.Registry {
   if (typeof ToolPkg === "undefined" || !ToolPkg || !ToolPkg.ipc ||
       typeof ToolPkg.ipc.call !== "function") {
     throw new Error("ToolPkg IPC is unavailable");
@@ -541,58 +681,81 @@ function runtime() {
   return ToolPkg;
 }
 
-function ipcError(code, message, details) {
-  const error = new Error(String(message || ""));
+function ipcError(code: unknown, message: unknown, details?: DynamicValue): Error & { code?: string; details?: DynamicValue } {
+  const error: Error & { code?: string; details?: DynamicValue } = new Error(String(message || ""));
   error.name = "DashboardIpcError";
   error.code = String(code || "operation_failed");
   if (details !== undefined) error.details = details;
   return error;
 }
 
-function failedResponseError(result) {
-  const errorObject = result && result.error && typeof result.error === "object" ? result.error : null;
-  const code = String(result && result.code || errorObject && errorObject.code || "operation_failed");
+function failedResponseError(resultValue: DynamicValue): Error {
+  const result = asRecord(resultValue);
+  const errorObject = asRecord(result.error);
+  const code = String(result.code || errorObject.code || "operation_failed");
   const message = typeof result.error === "string"
     ? result.error
-    : String(errorObject && errorObject.message || result.message || "");
+    : String(errorObject.message || result.message || "");
   const details = result.details !== undefined
     ? result.details
-    : (errorObject && errorObject.details !== undefined ? errorObject.details : undefined);
+    : (errorObject.details !== undefined ? errorObject.details : undefined);
   return ipcError(code, message, details);
 }
 
-async function callMain(channel, payload) {
-  const result = await runtime().ipc.call(channel, payload || {}, IPC_OPTIONS);
-  if (!result || typeof result !== "object") {
-    throw ipcError("ipc_invalid_response", "", { channel, response: result ?? null });
-  }
-  if (result.success === false) throw failedResponseError(result);
-  return result;
+type DashboardIpcCall = (
+  channel: string,
+  payload: DynamicRecord,
+) => Promise<DynamicRecord>;
+
+function captureIpcCall(): DashboardIpcCall {
+  const call = runtime().ipc.call;
+  return async (channel, payload) => {
+    const result = await call<DynamicRecord, DynamicRecord>(channel, payload || {});
+    if (!result || typeof result !== "object") {
+      throw ipcError("ipc_invalid_response", "", { channel, response: result ?? null });
+    }
+    if (result.success === false) throw failedResponseError(result);
+    return result;
+  };
 }
 
 const api = {
-  listAgents: (payload) => callMain(CHANNELS.LIST_AGENTS, payload),
-  inspectAgent: (agentId) => callMain(CHANNELS.INSPECT_AGENT, { agent_id: agentId }),
-  listTree: (payload) => callMain(CHANNELS.LIST_TREE, payload),
-  getSettings: () => callMain(CHANNELS.GET_SETTINGS, {}),
-  updateSettings: (payload) => callMain(CHANNELS.UPDATE_SETTINGS, payload),
-  deleteAgent: (agentId) => callMain(CHANNELS.DELETE_AGENT, { agent_id: agentId }),
-  clearHistory: () => callMain(CHANNELS.CLEAR_HISTORY, {}),
-  spawnAgent: (payload) => callMain(CHANNELS.SPAWN_AGENT, payload),
-  sendMessage: (payload) => callMain(CHANNELS.SEND_MESSAGE, payload),
-  followupTask: (payload) => callMain(CHANNELS.FOLLOWUP_TASK, payload),
-  waitAgent: (agentId, timeoutMs = 5000) => callMain(CHANNELS.WAIT_AGENT, {
-    agent_ids: [agentId],
-    timeout_ms: timeoutMs,
-  }),
-  interruptAgent: (payload) => callMain(CHANNELS.INTERRUPT_AGENT, payload),
+  listAgents: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.LIST_AGENTS, payload),
+  inspectAgent: (agentId: string, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.INSPECT_AGENT, { agent_id: agentId }),
+  listTree: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.LIST_TREE, payload),
+  watchTreeEvents: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.WATCH_TREE_EVENTS, payload),
+  getSettings: (ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.GET_SETTINGS, {}),
+  updateSettings: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.UPDATE_SETTINGS, payload),
+  deleteAgent: (agentId: string, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.DELETE_AGENT, { agent_id: agentId }),
+  clearHistory: (ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.CLEAR_HISTORY, {}),
+  spawnAgent: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.SPAWN_AGENT, payload),
+  sendMessage: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.SEND_MESSAGE, payload),
+  followupTask: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.FOLLOWUP_TASK, payload),
+  waitAgent: (agentId: string, timeoutMs = 5000, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.WAIT_AGENT, {
+      agent_ids: [agentId],
+      timeout_ms: timeoutMs,
+    }),
+  interruptAgent: (payload: DynamicRecord, ipcCall: DashboardIpcCall = captureIpcCall()) =>
+    ipcCall(CHANNELS.INTERRUPT_AGENT, payload),
 };
 
-function isTerminal(status) {
+function isTerminal(status: unknown): boolean {
   return TERMINAL_STATUSES.has(String(status || ""));
 }
 
-function allowedActions(status) {
+function allowedActions(status: unknown): AllowedActions {
   const value = String(status || "");
   return {
     message: ACTIVE_STATUSES.has(value),
@@ -602,19 +765,19 @@ function allowedActions(status) {
   };
 }
 
-function mergeAgents(current, incoming) {
-  const map = new Map();
+function mergeAgents(current: DashboardAgent[], incoming: DashboardAgent[]): DashboardAgent[] {
+  const map = new Map<string, DashboardAgent>();
   for (const agent of Array.isArray(current) ? current : []) map.set(agent.id, agent);
   for (const agent of Array.isArray(incoming) ? incoming : []) map.set(agent.id, agent);
   return Array.from(map.values());
 }
 
-function shortId(value, size = 12) {
+function shortId(value: unknown, size = 12): string {
   const text = String(value || "");
   return text.length > size ? `${text.slice(0, size)}...` : text;
 }
 
-function statusColor(status) {
+function statusColor(status: unknown): string {
   if (status === "failed" || status === "orphaned") return "errorContainer";
   if (status === "running") return "primaryContainer";
   if (status === "queued" || status === "cancelling") return "secondaryContainer";
@@ -624,19 +787,19 @@ function statusColor(status) {
   return "surfaceVariant";
 }
 
-function countSummary(result) {
-  const counts = result && result.status_counts && typeof result.status_counts === "object"
-    ? result.status_counts
-    : {};
+function countSummary(resultValue: DynamicValue): DashboardSummary {
+  const result = asRecord(resultValue);
+  const counts = asRecord(result.status_counts);
   return {
-    active: Number(result && result.active) || 0,
-    queued: Number(result && result.queued) || 0,
-    total: Number(result && result.total) || 0,
+    active: Number(result.active) || 0,
+    running: Number(counts.running) || 0,
+    queued: Number(result.queued) || 0,
+    total: Number(result.total) || 0,
     counts,
   };
 }
 
-function parseTargetPaths(text) {
+function parseTargetPaths(text: unknown): string[] {
   return Array.from(new Set(
     String(text || "")
       .split(/\r?\n/)
@@ -645,16 +808,16 @@ function parseTargetPaths(text) {
   ));
 }
 
-function isAbsolutePath(value) {
+function isAbsolutePath(value: unknown): boolean {
   const path = String(value || "").trim();
   return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
 }
 
-function normalizeForCompare(value) {
+function normalizeForCompare(value: unknown): string {
   return String(value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
 }
 
-function isWithinWorkspace(path, workspace) {
+function isWithinWorkspace(path: unknown, workspace: unknown): boolean {
   const child = normalizeForCompare(path);
   const root = normalizeForCompare(workspace);
   if (!root) return true;
@@ -663,20 +826,24 @@ function isWithinWorkspace(path, workspace) {
   return left === right || left.startsWith(`${right}/`);
 }
 
-function validateCommon(input) {
-  const errors = [];
+function validateCommon(input: DynamicRecord): string[] {
+  const errors: string[] = [];
   if (!String(input.task || "").trim()) errors.push("task_required");
   if (!["android", "linux"].includes(String(input.workspace_env || "android"))) errors.push("workspace_env_invalid");
   if (!["high", "normal", "low"].includes(String(input.priority || "normal"))) errors.push("priority_invalid");
   const timeout = Number(input.timeout_ms);
-  if (!Number.isInteger(timeout) || timeout < 30000 || timeout > 3600000) errors.push("timeout_invalid");
+  if (!Number.isInteger(timeout) || (timeout !== 0 && (timeout < 30000 || timeout > 3600000))) {
+    errors.push("timeout_invalid");
+  }
   const maxTools = Number(input.max_tool_calls);
-  if (!Number.isInteger(maxTools) || maxTools < 1 || maxTools > 64) errors.push("max_tool_calls_invalid");
+  if (!Number.isInteger(maxTools) || (maxTools !== 0 && (maxTools < 1 || maxTools > 64))) {
+    errors.push("max_tool_calls_invalid");
+  }
   return errors;
 }
 
-function validatePaths(input, paths) {
-  const errors = [];
+function validatePaths(input: DynamicRecord, paths: string[]): string[] {
+  const errors: string[] = [];
   if (input.read_only !== true && paths.length === 0) errors.push("write_paths_required");
   for (const path of paths) {
     if (!isAbsolutePath(path)) errors.push("path_not_absolute");
@@ -685,15 +852,15 @@ function validatePaths(input, paths) {
   return Array.from(new Set(errors));
 }
 
-function validateSpawn(input) {
+function validateSpawn(input: DynamicRecord): ValidationResult {
   const paths = input.read_only === true ? [] : parseTargetPaths(input.target_paths_text);
   const errors = [...validateCommon(input), ...validatePaths(input, paths)];
   if (input.workspace_path && !isAbsolutePath(input.workspace_path)) errors.push("workspace_not_absolute");
   return { valid: errors.length === 0, errors: Array.from(new Set(errors)), target_paths: paths };
 }
 
-function validateFollowup(input, currentAgent) {
-  const errors = [];
+function validateFollowup(input: DynamicRecord, currentAgent: DashboardAgent | null): ValidationResult {
+  const errors: string[] = [];
   if (!String(input.task || "").trim()) errors.push("task_required");
   const mode = String(input.permission_mode || "readonly");
   if (!["inherit", "readonly", "write"].includes(mode)) errors.push("permission_mode_invalid");
@@ -721,44 +888,45 @@ function validateFollowup(input, currentAgent) {
   };
 }
 
-function stableValue(value) {
+function stableValue(value: DynamicValue): DynamicValue {
   if (Array.isArray(value)) return value.map(stableValue);
   if (value && typeof value === "object") {
-    const output = {};
-    for (const key of Object.keys(value).sort()) {
-      if (value[key] !== undefined) output[key] = stableValue(value[key]);
+    const input = asRecord(value);
+    const output: DynamicRecord = {};
+    for (const key of Object.keys(input).sort()) {
+      if (input[key] !== undefined) output[key] = stableValue(input[key]);
     }
     return output;
   }
   return value;
 }
 
-function fingerprint(payload) {
+function fingerprint(payload: DynamicValue): string {
   return JSON.stringify(stableValue(payload || {}));
 }
 
-function generateRequestId(operation) {
+function generateRequestId(operation: unknown): string {
   return `ui:${String(operation || "operation")}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function nextRequest(previous, operation, payload) {
+function nextRequest(previous: RequestEntry | null | undefined, operation: string, payload: DynamicRecord): RequestEntry {
   const nextFingerprint = fingerprint(payload);
   if (previous && previous.status !== "succeeded" && previous.fingerprint === nextFingerprint) return previous;
   return { requestId: generateRequestId(operation), fingerprint: nextFingerprint, status: "pending" };
 }
 
-function markRequest(entry, status) {
+function markRequest(entry: RequestEntry | null | undefined, status: string): RequestEntry | null {
   return entry ? { ...entry, status } : null;
 }
 
-function sectionTitle(ctx, text) {
+function sectionTitle(ctx: UiContext, text: string): UiNode {
   return ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center", spacing: 8 }, [
     ctx.UI.Surface({ width: 4, height: 18, containerColor: "primary", shape: SHAPE_PILL }, []),
     ctx.UI.Text({ text, style: "titleMedium", fontWeight: "semiBold", weight: 1 }),
   ]);
 }
 
-function errorCard(ctx, message) {
+function errorCard(ctx: UiContext, message: unknown): UiNode | null {
   if (!String(message || "").trim()) return null;
   return ctx.UI.Card({
     fillMaxWidth: true,
@@ -774,14 +942,14 @@ function errorCard(ctx, message) {
   ]);
 }
 
-function noticeCard(ctx, message, color = "secondaryContainer") {
+function noticeCard(ctx: UiContext, message: unknown, color = "secondaryContainer"): UiNode | null {
   if (!String(message || "").trim()) return null;
   return ctx.UI.Card({ fillMaxWidth: true, containerColor: color, shape: SHAPE_MEDIUM }, [
     ctx.UI.Text({ text: String(message), padding: 14, style: "bodyMedium", softWrap: true }),
   ]);
 }
 
-function loadingRow(ctx, text) {
+function loadingRow(ctx: UiContext, text: string): UiNode {
   return ctx.UI.Surface({ fillMaxWidth: true, containerColor: "surfaceVariant", shape: SHAPE_MEDIUM }, [
     ctx.UI.Row({
       padding: { horizontal: 14, vertical: 12 },
@@ -796,7 +964,7 @@ function loadingRow(ctx, text) {
   ]);
 }
 
-function statCard(ctx, label, value, color = "surfaceVariant") {
+function statCard(ctx: UiContext, label: string, value: unknown, color = "surfaceVariant"): UiNode {
   return ctx.UI.Card({
     weight: 1,
     containerColor: color,
@@ -810,7 +978,7 @@ function statCard(ctx, label, value, color = "surfaceVariant") {
   ]);
 }
 
-function keyValue(ctx, label, value) {
+function keyValue(ctx: UiContext, label: string, value: unknown): UiNode | null {
   if (value === undefined || value === null || String(value) === "") return null;
   return ctx.UI.Row({
     fillMaxWidth: true,
@@ -823,12 +991,13 @@ function keyValue(ctx, label, value) {
   ]);
 }
 
-function localizedOption(options, value, fallback) {
+function localizedOption(options: DynamicValue, value: unknown, fallback: unknown): string {
   const key = String(value || "");
-  return options && options[key] || fallback || key;
+  const optionMap = asRecord(options);
+  return String(optionMap[key] || fallback || key);
 }
 
-function statusBadge(ctx, label, status) {
+function statusBadge(ctx: UiContext, label: string, status: unknown): UiNode {
   return ctx.UI.Surface({
     containerColor: statusColor(status),
     shape: SHAPE_PILL,
@@ -844,7 +1013,12 @@ function statusBadge(ctx, label, status) {
   ]);
 }
 
-function agentCard(ctx, agent, text, onOpen) {
+function agentCard(
+  ctx: UiContext,
+  agent: DashboardAgent,
+  text: DashboardText,
+  onOpen: (agentId: string) => void,
+): UiNode {
   const execution = agent.execution || {};
   const status = localizedOption(text.statusOptions, agent.status, text.unknown);
   const priority = localizedOption(text.priorityOptions, agent.priority || "normal", agent.priority || "normal");
@@ -900,7 +1074,7 @@ function agentCard(ctx, agent, text, onOpen) {
   ]);
 }
 
-function textField(ctx, label, state, options) {
+function textField<T>(ctx: UiContext, label: string, state: StateValue<T>, options: DynamicRecord = {}): UiNode {
   return ctx.UI.TextField({
     label,
     value: state.value,
@@ -910,7 +1084,7 @@ function textField(ctx, label, state, options) {
   });
 }
 
-function panel(ctx, children, options = {}) {
+function panel(ctx: UiContext, children: unknown[], options: DynamicRecord = {}): UiNode {
   return ctx.UI.Surface({
     fillMaxWidth: true,
     containerColor: options.containerColor || "surface",
@@ -920,7 +1094,12 @@ function panel(ctx, children, options = {}) {
   ]);
 }
 
-function pageHeader(ctx, title, onBack, trailing) {
+function pageHeader(
+  ctx: UiContext,
+  title: PageHeaderTitle,
+  onBack: (() => void) | null = null,
+  trailing: unknown = null,
+): UiNode {
   return ctx.UI.Surface({ fillMaxWidth: true, containerColor: "surface", shape: SHAPE_LARGE }, [
     ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center", padding: { horizontal: 8, vertical: 6 }, spacing: 8 }, compact([
       onBack ? ctx.UI.Button({ text: title.back, shape: SHAPE_SMALL, onClick: onBack }) : null,
@@ -930,7 +1109,7 @@ function pageHeader(ctx, title, onBack, trailing) {
   ]);
 }
 
-function emptyState(ctx, text) {
+function emptyState(ctx: UiContext, text: string): UiNode {
   return ctx.UI.Card({ fillMaxWidth: true, containerColor: "surfaceVariant", shape: SHAPE_LARGE, border: CARD_BORDER }, [
     ctx.UI.Column({ fillMaxWidth: true, padding: { horizontal: 18, vertical: 24 }, spacing: 8 }, [
       ctx.UI.Row({ fillMaxWidth: true, horizontalArrangement: "center" }, [
@@ -943,8 +1122,9 @@ function emptyState(ctx, text) {
   ]);
 }
 
-function resultJson(value) {
-  if (value && typeof value === "object") return value;
+function resultJson(value: DynamicValue): DynamicRecord | unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return asRecord(value);
   const source = String(value || "").trim();
   if (!source) return null;
   const fenced = source.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -958,30 +1138,30 @@ function resultJson(value) {
   }
 }
 
-function readableResultField(value) {
+function readableResultField(value: unknown): string {
   return String(value || "value")
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/_/g, " ")
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function resultFieldLabel(field, text) {
-  return text.resultFields[field] || readableResultField(field);
+function resultFieldLabel(field: string, text: DashboardText): string {
+  return asRecord(text.resultFields)[field] as string || readableResultField(field);
 }
 
-function resultScalar(value, text) {
+function resultScalar(value: DynamicValue, text: DashboardText): string {
   if (value === true) return text.yes;
   if (value === false) return text.no;
   if (value === null || value === undefined) return "-";
   return String(value);
 }
 
-function resultFieldValue(field, value, text) {
+function resultFieldValue(field: string, value: DynamicValue, text: DashboardText): string {
   if (field === "status") return localizedOption(text.statusOptions, value, String(value || ""));
   return resultScalar(value, text);
 }
 
-function flattenResult(value, text, path = [], depth = 0, output = []) {
+function flattenResult(value: DynamicValue, text: DashboardText, path: string[] = [], depth = 0, output: ResultRow[] = []): ResultRow[] {
   if (output.length >= 16) return output;
   const field = path[path.length - 1] || "result";
   const label = path.map((part) => resultFieldLabel(part, text)).join(" · ") || text.result;
@@ -1020,11 +1200,12 @@ function flattenResult(value, text, path = [], depth = 0, output = []) {
   return output;
 }
 
-function structuredResultCard(ctx, value, text) {
+function structuredResultCard(ctx: UiContext, value: DynamicValue, text: DashboardText): UiNode | null {
   const parsed = resultJson(value);
   if (!parsed) return null;
-  const success = parsed.success === true || parsed.ok === true;
-  const failure = parsed.success === false || parsed.ok === false || !!parsed.error;
+  const record = asRecord(parsed);
+  const success = record.success === true || record.ok === true;
+  const failure = record.success === false || record.ok === false || !!record.error;
   const title = success ? text.resultSuccess : failure ? text.resultFailure : text.resultStructured;
   const color = failure ? "errorContainer" : success ? "primaryContainer" : "surfaceVariant";
   const icon = failure ? "error" : success ? "checkCircle" : "dataObject";
@@ -1051,7 +1232,7 @@ function structuredResultCard(ctx, value, text) {
   ]);
 }
 
-function markdownInlineText(value) {
+function markdownInlineText(value: unknown): string {
   return String(value || "")
     .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, "$1 ($2)")
     .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, "$1 ($2)")
@@ -1060,12 +1241,12 @@ function markdownInlineText(value) {
     .replace(/`([^`\n]+)`/g, "$1");
 }
 
-function parseMarkdownBlocks(value) {
+function parseMarkdownBlocks(value: unknown): MarkdownBlock[] {
   const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
-  const blocks = [];
-  let paragraph = [];
-  let quote = [];
-  let code = null;
+  const blocks: MarkdownBlock[] = [];
+  let paragraph: string[] = [];
+  let quote: string[] = [];
+  let code: string[] | null = null;
   let codeLanguage = "";
   const flushParagraph = () => {
     if (paragraph.length > 0) blocks.push({ type: "paragraph", text: paragraph.join(" ") });
@@ -1136,12 +1317,12 @@ function parseMarkdownBlocks(value) {
   return blocks;
 }
 
-function markdownBlockView(ctx, block) {
+function markdownBlockView(ctx: UiContext, block: MarkdownBlock): UiNode {
   if (block.type === "heading") {
     const styles = ["titleLarge", "titleLarge", "titleMedium", "titleSmall", "bodyLarge", "bodyLarge"];
     return ctx.UI.Text({
       text: markdownInlineText(block.text),
-      style: styles[Math.max(0, Math.min(5, block.level - 1))],
+      style: styles[Math.max(0, Math.min(5, Number(block.level || 1) - 1))],
       fontWeight: "bold",
       softWrap: true,
     });
@@ -1181,7 +1362,7 @@ function markdownBlockView(ctx, block) {
   return ctx.UI.Text({ text: markdownInlineText(block.text), style: "bodyMedium", softWrap: true });
 }
 
-function markdownPreviewText(value) {
+function markdownPreviewText(value: unknown): string {
   return parseMarkdownBlocks(value)
     .filter((block) => block.type !== "divider")
     .map((block) => {
@@ -1194,7 +1375,13 @@ function markdownPreviewText(value) {
     .join("\n");
 }
 
-function resultView(ctx, value, text, expanded, onToggle) {
+function resultView(
+  ctx: UiContext,
+  value: DynamicValue,
+  text: DashboardText,
+  expanded = false,
+  onToggle: (() => void) | null = null,
+): UiNode {
   const structured = structuredResultCard(ctx, value, text);
   if (structured) return structured;
   const content = String(value || "").trim();
@@ -1216,7 +1403,7 @@ function resultView(ctx, value, text, expanded, onToggle) {
   ]);
 }
 
-function formatEventTime(value) {
+function formatEventTime(value: unknown): string {
   const timestamp = Number(value);
   if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
   try {
@@ -1226,13 +1413,13 @@ function formatEventTime(value) {
   }
 }
 
-function readableEventType(value) {
+function readableEventType(value: unknown): string {
   return String(value || "unknown")
     .replace(/_/g, " ")
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
-function eventValue(value, text) {
+function eventValue(value: DynamicValue, text: DashboardText): string {
   if (value === true) return text.yes;
   if (value === false) return text.no;
   if (value === null || value === undefined || value === "") return "";
@@ -1242,15 +1429,15 @@ function eventValue(value, text) {
   return String(value);
 }
 
-function eventFieldValue(field, value, text) {
+function eventFieldValue(field: string, value: DynamicValue, text: DashboardText): string {
   if (field === "status") return localizedOption(text.statusOptions, value, String(value || ""));
   if (field === "control_status") return localizedOption(text.controlStatusOptions, value, String(value || ""));
   if (field === "control_source") return localizedOption(text.controlSourceOptions, value, String(value || ""));
   return eventValue(value, text);
 }
 
-function eventSummary(event, text) {
-  const data = event && event.data && typeof event.data === "object" ? event.data : {};
+function eventSummary(event: DynamicRecord, text: DashboardText): string[] {
+  const data = asRecord(event.data);
   const preferredFields = [
     "status", "tool_name", "step", "attempt", "action", "kind", "tools",
     "allowed_tools", "pending_metadata", "mutation_checkpoint_index", "control_action",
@@ -1259,12 +1446,12 @@ function eventSummary(event, text) {
     "prior_run_seq", "recovered", "epoch", "expected_epoch", "received_epoch",
     "tool_count", "checkpoint_turns", "continuation_required", "prompt_echo_detected",
   ];
-  const lines = [];
-  const used = new Set();
+  const lines: string[] = [];
+  const used = new Set<string>();
   for (const field of preferredFields) {
     const value = eventFieldValue(field, data[field], text);
     if (!value) continue;
-    const label = text.eventFields[field] || readableEventType(field);
+    const label = String(asRecord(text.eventFields)[field] || readableEventType(field));
     lines.push(`${label}: ${value}`);
     used.add(field);
     if (lines.length >= 4) break;
@@ -1274,9 +1461,9 @@ function eventSummary(event, text) {
   return lines;
 }
 
-function eventCard(ctx, event, text) {
+function eventCard(ctx: UiContext, event: DynamicRecord, text: DashboardText): UiNode {
   const type = String(event && event.type || "unknown");
-  const title = text.eventTypes[type] || readableEventType(type);
+  const title = String(asRecord(text.eventTypes)[type] || readableEventType(type));
   const time = formatEventTime(event && event.created_at);
   const meta = compact([
     time,
@@ -1318,12 +1505,12 @@ const VIEW_MESSAGE = "message";
 const VIEW_FOLLOWUP = "followup";
 const VIEW_CONFIRM = "confirm";
 
-function useStateValue(ctx, key, initialValue) {
+function useStateValue<T>(ctx: UiContext, key: string, initialValue: T): StateValue<T> {
   const pair = ctx.useState(key, initialValue);
   return { value: pair[0], set: pair[1] };
 }
 
-function stringifyErrorDetails(details) {
+function stringifyErrorDetails(details: DynamicValue): string {
   if (details === undefined || details === null || details === "") return "";
   if (typeof details === "string") return details;
   try {
@@ -1333,40 +1520,44 @@ function stringifyErrorDetails(details) {
   }
 }
 
-function formatErrorText(error, text = null) {
-  const code = String(error && error.code || "");
-  const localized = code && text && text.errors ? text.errors[code] : "";
+function formatErrorText(error: DynamicValue, text: DynamicValue = null) {
+  const errorRecord = asRecord(error);
+  const textRecord = asRecord(text);
+  const localizedErrors = asRecord(textRecord.errors);
+  const code = String(errorRecord.code || "");
+  const localized = code ? localizedErrors[code] : "";
   const message = error instanceof Error ? error.message : String(error || "");
-  const details = stringifyErrorDetails(error && error.details);
-  const parts = [localized || message || (text && text.unknown) || "unknown error"];
+  const details = stringifyErrorDetails(errorRecord.details);
+  const parts = [localized || message || textRecord.unknown || "unknown error"];
   if (localized && message && message !== localized) parts.push(message);
   if (details && details !== message) parts.push(details);
   return parts.join(": ");
 }
 
-function errorText(error) {
+function errorText(error: DynamicValue): string {
   return formatErrorText(error);
 }
 
-function waitFor(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function waitFor(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(() => resolve(), ms));
 }
 
-function shouldRetryInitialLoad(error) {
-  return error && error.code === "ipc_invalid_response" ||
+function shouldRetryInitialLoad(error: DynamicValue): boolean {
+  return asRecord(error).code === "ipc_invalid_response" ||
     /ipc|runtime|channel|unavailable|not registered|not initialized/i.test(errorText(error));
 }
 
-function compact(nodes) {
-  return nodes.filter(Boolean);
+function compact<T>(nodes: Array<T | null | undefined | false | "">): T[] {
+  return nodes.filter(Boolean) as T[];
 }
 
-function validationText(text, errors) {
-  return errors.map((code) => text.errors[code] || code).join("\n");
+function validationText(text: DashboardText, errors: string[]): string {
+  const localizedErrors = asRecord(text.errors);
+  return errors.map((code) => String(localizedErrors[code] || code)).join("\n");
 }
 
-function permissionSummary(agent, text) {
-  const paths = Array.isArray(agent && agent.target_paths) ? agent.target_paths : [];
+function permissionSummary(agent: DashboardAgent, text: DashboardText): string {
+  const paths: string[] = Array.isArray(agent.target_paths) ? agent.target_paths : [];
   return [
     `${text.readOnly}: ${agent && agent.read_only ? text.yes : text.no}`,
     `${text.workspacePath}: ${agent && agent.workspace_path || "-"}`,
@@ -1374,10 +1565,28 @@ function permissionSummary(agent, text) {
     `${text.targetPaths}:\n${paths.length ? paths.join("\n") : "-"}`,
   ].join("\n");
 }
+type UnknownRecord = Record<string, unknown>;
+type IpcError = {
+  code?: string;
+  message: string;
+  details?: unknown;
+};
+type IpcResponse<T> = {
+  success: boolean;
+  data?: T;
+  error?: IpcError | string;
+};
 
-function Screen(ctx) {
+type ComposeDslScreenResult = ToolPkg.ComposeNode | Promise<ToolPkg.ComposeNode>;
+
+type ValueState<T> = {
+  value: T;
+};
+
+
+function Screen(ctx: ToolPkg.ComposeDslContext): ComposeDslScreenResult {
   const text = resolveText(ctx);
-  const errorText = (cause) => formatErrorText(cause, text);
+  const errorText = (cause: DynamicValue): string => formatErrorText(cause, text);
   const view = useStateValue(ctx, "dashboard.view", VIEW_LIST);
   const listLoading = useStateValue(ctx, "dashboard.listLoading", false);
   const loadMoreLoading = useStateValue(ctx, "dashboard.loadMoreLoading", false);
@@ -1386,21 +1595,27 @@ function Screen(ctx) {
   const waitLoading = useStateValue(ctx, "dashboard.waitLoading", false);
   const error = useStateValue(ctx, "dashboard.error", "");
   const notice = useStateValue(ctx, "dashboard.notice", "");
-  const agents = useStateValue(ctx, "dashboard.agents", []);
-  const summary = useStateValue(ctx, "dashboard.summary", { active: 0, queued: 0, total: 0, counts: {} });
-  const cursor = useStateValue(ctx, "dashboard.cursor", "");
-  const hasMore = useStateValue(ctx, "dashboard.hasMore", false);
-  const statusFilter = useStateValue(ctx, "dashboard.statusFilter", "");
-  const listRequestGuard = useStateValue(ctx, "dashboard.listRequestGuard", { generation: 0 });
-  const detailRequestGuard = useStateValue(ctx, "dashboard.detailRequestGuard", { generation: 0 });
-  const selectedAgent = useStateValue(ctx, "dashboard.selectedAgent", null);
-  const treeNodes = useStateValue(ctx, "dashboard.treeNodes", []);
-  const expandedTreeTasks = useStateValue(ctx, "dashboard.expandedTreeTasks", {});
-  const showResult = useStateValue(ctx, "dashboard.showResult", false);
-  const resultExpanded = useStateValue(ctx, "dashboard.resultExpanded", false);
-  const confirmAction = useStateValue(ctx, "dashboard.confirmAction", null);
-  const requestLedger = useStateValue(ctx, "dashboard.requestLedger", {});
+  const agents = useStateValue<DashboardAgent[]>(ctx, "dashboard.agents", []);
+  const summary = useStateValue<DashboardSummary>(ctx, "dashboard.summary", { active: 0, running: 0, queued: 0, total: 0, counts: {} });
+  const cursor = useStateValue<string>(ctx, "dashboard.cursor", "");
+  const hasMore = useStateValue<boolean>(ctx, "dashboard.hasMore", false);
+  const statusFilter = useStateValue<string>(ctx, "dashboard.statusFilter", "");
+  const listRequestGuard = useStateValue<{ generation: number }>(ctx, "dashboard.listRequestGuard", { generation: 0 });
+  const detailRequestGuard = useStateValue<{ generation: number }>(ctx, "dashboard.detailRequestGuard", { generation: 0 });
+  const treeWatchGuard = useStateValue<{ generation: number; revision: number; rootRunId: string; agentId: string }>(
+    ctx,
+    "dashboard.treeWatchGuard",
+    { generation: 0, revision: 0, rootRunId: "", agentId: "" },
+  );
+  const selectedAgent = useStateValue<DashboardAgent | null>(ctx, "dashboard.selectedAgent", null);
+  const treeNodes = useStateValue<DynamicRecord[]>(ctx, "dashboard.treeNodes", []);
+  const expandedTreeTasks = useStateValue<Record<string, boolean>>(ctx, "dashboard.expandedTreeTasks", {});
+  const resultExpanded = useStateValue<boolean>(ctx, "dashboard.resultExpanded", false);
+  const confirmAction = useStateValue<ConfirmAction | null>(ctx, "dashboard.confirmAction", null);
+  const requestLedger = useStateValue<RequestLedger>(ctx, "dashboard.requestLedger", {});
   const settingsLoading = useStateValue(ctx, "dashboard.settings.loading", false);
+  const packageUpdateLoading = useStateValue(ctx, "dashboard.packageUpdate.loading", false);
+  const packageUpdatePhase = useStateValue(ctx, "dashboard.packageUpdate.phase", "idle");
   const globalMaxAgents = useStateValue(ctx, "dashboard.settings.maxAgents", "6");
   const globalMaxActiveRunsPerRoot = useStateValue(ctx, "dashboard.settings.maxActiveRunsPerRoot", "3");
   const globalMaxTools = useStateValue(ctx, "dashboard.settings.maxTools", "16");
@@ -1431,51 +1646,57 @@ function Screen(ctx) {
     notice.set("");
   }
 
-  function toast(message) {
+  function toast(message: string): void {
     if (ctx && typeof ctx.showToast === "function") ctx.showToast(message);
   }
 
-  function requestEntry(operation, payload) {
+  function requestEntry(operation: string, payload: DynamicRecord): RequestEntry {
     const entry = nextRequest(requestLedger.value[operation], operation, payload);
     requestLedger.set({ ...requestLedger.value, [operation]: entry });
     return entry;
   }
 
-  function requestStatus(operation, entry, status) {
+  function requestStatus(operation: string, entry: RequestEntry | null, status: string): void {
     requestLedger.set({ ...requestLedger.value, [operation]: markRequest(entry, status) });
   }
 
-  async function loadGlobalSettings() {
-    const result = await api.getSettings();
-    const value = result.settings || {};
+  async function loadGlobalSettings(
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ) {
+    const result = await api.getSettings(ipcCall);
+    const value = asRecord(result.settings);
     globalMaxAgents.set(String(value.max_concurrent_agents ?? 6));
     globalMaxActiveRunsPerRoot.set(String(value.max_active_runs_per_root ?? 3));
     globalMaxTools.set(String(value.max_tool_calls ?? 16));
     globalMaxModelRetries.set(String(value.max_model_retries ?? 5));
-    conversationContextMode.set(["off", "on", "auto"].includes(value.conversation_context_mode)
-      ? value.conversation_context_mode
+    const contextMode = String(value.conversation_context_mode || "");
+    conversationContextMode.set(["off", "on", "auto"].includes(contextMode)
+      ? contextMode
       : "auto");
     return value;
   }
 
-  async function saveGlobalSettings() {
+  async function saveGlobalSettings(
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ) {
     clearFeedback();
     const maxAgents = Number(globalMaxAgents.value);
     const maxActiveRunsPerRoot = Number(globalMaxActiveRunsPerRoot.value);
     const maxTools = Number(globalMaxTools.value);
     const maxModelRetries = Number(globalMaxModelRetries.value);
-    const errors = [];
-    if (!Number.isInteger(maxAgents) || maxAgents < 1 || maxAgents > 16) {
+    const errors: string[] = [];
+    if (!Number.isInteger(maxAgents) || (maxAgents !== 0 && (maxAgents < 1 || maxAgents > 16))) {
       errors.push("max_concurrent_agents_invalid");
     }
-    if (!Number.isInteger(maxActiveRunsPerRoot) || maxActiveRunsPerRoot < 1 ||
-        maxActiveRunsPerRoot > 8 || maxActiveRunsPerRoot > maxAgents) {
+    if (!Number.isInteger(maxActiveRunsPerRoot) ||
+        (maxActiveRunsPerRoot !== 0 && (maxActiveRunsPerRoot < 1 || maxActiveRunsPerRoot > 8)) ||
+        (maxAgents > 0 && maxActiveRunsPerRoot > maxAgents)) {
       errors.push("max_active_runs_per_root_invalid");
     }
-    if (!Number.isInteger(maxTools) || maxTools < 1 || maxTools > 64) {
+    if (!Number.isInteger(maxTools) || (maxTools !== 0 && (maxTools < 1 || maxTools > 64))) {
       errors.push("max_tool_calls_invalid");
     }
-    if (!Number.isInteger(maxModelRetries) || maxModelRetries < 0 || maxModelRetries > 12) {
+    if (!Number.isInteger(maxModelRetries) || maxModelRetries < -1 || maxModelRetries > 12) {
       errors.push("max_model_retries_invalid");
     }
     if (!["off", "on", "auto"].includes(conversationContextMode.value)) {
@@ -1493,18 +1714,19 @@ function Screen(ctx) {
         max_tool_calls: maxTools,
         max_model_retries: maxModelRetries,
         conversation_context_mode: conversationContextMode.value,
-      });
-      const value = result.settings || {};
+      }, ipcCall);
+      const value = asRecord(result.settings);
       globalMaxAgents.set(String(value.max_concurrent_agents ?? maxAgents));
       globalMaxActiveRunsPerRoot.set(String(value.max_active_runs_per_root ?? maxActiveRunsPerRoot));
       globalMaxTools.set(String(value.max_tool_calls ?? maxTools));
       globalMaxModelRetries.set(String(value.max_model_retries ?? maxModelRetries));
-      conversationContextMode.set(["off", "on", "auto"].includes(value.conversation_context_mode)
-        ? value.conversation_context_mode
+      const contextMode = String(value.conversation_context_mode || "");
+      conversationContextMode.set(["off", "on", "auto"].includes(contextMode)
+        ? contextMode
         : conversationContextMode.value);
       notice.set(text.settingsSaved);
       toast(text.settingsSaved);
-      await refresh(true);
+      await refresh(true, undefined, {}, ipcCall);
       return true;
     } catch (cause) {
       error.set(errorText(cause));
@@ -1514,7 +1736,12 @@ function Screen(ctx) {
     }
   }
 
-  async function refresh(reset = true, statusOverride, options = {}) {
+  async function refresh(
+    reset = true,
+    statusOverride: string | undefined = undefined,
+    options: DynamicRecord = {},
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ): Promise<boolean> {
     if (reset) listLoading.set(true);
     else loadMoreLoading.set(true);
     error.set("");
@@ -1527,7 +1754,7 @@ function Screen(ctx) {
     guard.generation = generation;
     try {
       const attempts = options.initial === true ? 3 : 1;
-      let result;
+      let result: DynamicRecord | null = null;
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         try {
           result = await api.listAgents({
@@ -1535,7 +1762,7 @@ function Screen(ctx) {
             cursor: requestedCursor,
             status: requestedStatus,
             include_results: false,
-          });
+          }, ipcCall);
           break;
         } catch (cause) {
           if (attempt >= attempts || !shouldRetryInitialLoad(cause)) throw cause;
@@ -1543,11 +1770,14 @@ function Screen(ctx) {
         }
       }
       if (guard.generation !== generation) return false;
-      const incoming = Array.isArray(result && result.agents) ? result.agents : [];
+      const response = result || {};
+      const incoming = Array.isArray(response.agents)
+        ? response.agents.map((agent) => asRecord(agent) as DashboardAgent)
+        : [];
       agents.set(reset ? incoming : mergeAgents(agents.value, incoming));
-      summary.set(countSummary(result));
-      cursor.set(result.next_cursor || "");
-      hasMore.set(result.has_more === true);
+      summary.set(countSummary(response));
+      cursor.set(String(response.next_cursor || ""));
+      hasMore.set(response.has_more === true);
       return true;
     } catch (cause) {
       if (guard.generation === generation) {
@@ -1562,7 +1792,115 @@ function Screen(ctx) {
     }
   }
 
-  async function loadDetail(agentId, switchView = true) {
+  function stopTreeWatch(): void {
+    const guard = treeWatchGuard.value;
+    guard.generation = (Number(guard.generation) || 0) + 1;
+    guard.revision = 0;
+    guard.rootRunId = "";
+    guard.agentId = "";
+  }
+
+  function eventIdentity(eventValue: DynamicValue): string {
+    const event = asRecord(eventValue);
+    return fingerprint({
+      execution_id: event.execution_id,
+      run_seq: event.run_seq,
+      type: event.type,
+      created_at: event.created_at,
+      data: asRecord(event.data),
+    });
+  }
+
+  function setSelectedAgent(value: DashboardAgent | null): void {
+    selectedAgent.value = value;
+    selectedAgent.set(value);
+  }
+
+  function mergeRecentEvents(currentValue: DynamicValue, incomingValue: DynamicValue): DynamicRecord[] {
+    const merged = new Map<string, DynamicRecord>();
+    const current = Array.isArray(currentValue) ? currentValue : [];
+    const incoming = Array.isArray(incomingValue) ? incomingValue : [];
+    for (const eventValue of [...current, ...incoming]) {
+      const event = asRecord(eventValue);
+      const key = eventIdentity(event);
+      if (!merged.has(key)) merged.set(key, event);
+    }
+    return Array.from(merged.values()).slice(-100);
+  }
+
+  async function refreshDetailSnapshot(
+    agentId: string,
+    isCurrent: () => boolean,
+    ipcCall: DashboardIpcCall,
+  ): Promise<{ loaded: boolean; rootRunId: string }> {
+    const detail = await ipcCall(CHANNELS.INSPECT_AGENT, { agent_id: agentId });
+    if (!isCurrent()) return { loaded: false, rootRunId: "" };
+    const nextAgent = detail.agent ? asRecord(detail.agent) as DashboardAgent : null;
+    const currentAgent = selectedAgent.value;
+    if (nextAgent && currentAgent && currentAgent.id === nextAgent.id) {
+      nextAgent.recent_events = mergeRecentEvents(currentAgent.recent_events, nextAgent.recent_events);
+    }
+    setSelectedAgent(nextAgent);
+    const tree = await ipcCall(CHANNELS.LIST_TREE, { agent_id: agentId });
+    if (!isCurrent()) return { loaded: false, rootRunId: "" };
+    const nextTreeNodes = Array.isArray(tree.nodes) ? tree.nodes.map(asRecord) : [];
+    treeNodes.set(nextTreeNodes);
+    const validExecutionIds = new Set(nextTreeNodes.map((node) => String(node && node.execution_id || "")).filter(Boolean));
+    expandedTreeTasks.set(Object.fromEntries(
+      Object.entries(expandedTreeTasks.value || {}).filter(([executionId, expanded]) => expanded === true && validExecutionIds.has(executionId))
+    ));
+    return { loaded: true, rootRunId: String(tree.root_run_id || "") };
+  }
+
+  async function watchDetailTree(
+    agentId: string,
+    rootRunId: string,
+    generation: number,
+    ipcCall: DashboardIpcCall,
+  ): Promise<void> {
+    const guard = treeWatchGuard.value;
+    const isCurrent = () => guard.generation === generation && guard.agentId === agentId && guard.rootRunId === rootRunId;
+    while (isCurrent()) {
+      try {
+        const result = await ipcCall(CHANNELS.WATCH_TREE_EVENTS, {
+          root_run_id: rootRunId,
+          after_revision: guard.revision,
+          limit: 100,
+          timeout_ms: 12000,
+        });
+        if (!isCurrent()) return;
+        const revision = Number(result.revision);
+        const nextRevision = Number(result.next_revision);
+        if (!Number.isSafeInteger(revision) || revision < 0 || !Number.isSafeInteger(nextRevision) || nextRevision < 0) return;
+        guard.revision = result.snapshot_required === true ? revision : nextRevision;
+        const events = Array.isArray(result.events) ? result.events.map(asRecord) : [];
+        const currentAgent = selectedAgent.value;
+        if (currentAgent && currentAgent.id === agentId && events.length > 0) {
+          selectedAgent.set({
+            ...currentAgent,
+            recent_events: mergeRecentEvents(
+              currentAgent.recent_events,
+              events.filter((event) => String(event.agent_id || "") === agentId),
+            ),
+          });
+        }
+        if (result.snapshot_required === true || events.length > 0) {
+          await refreshDetailSnapshot(agentId, isCurrent, ipcCall);
+        }
+        if (!isCurrent() || result.shutdown === true) return;
+      } catch (cause) {
+        if (!isCurrent()) return;
+        error.set(errorText(cause));
+        await waitFor(1000);
+      }
+    }
+  }
+
+  async function loadDetail(
+    agentId: string,
+    switchView = true,
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ): Promise<boolean> {
     detailLoading.set(true);
     error.set("");
     const currentAgentId = selectedAgent.value && selectedAgent.value.id;
@@ -1570,22 +1908,22 @@ function Screen(ctx) {
       expandedTreeTasks.set({});
       resultExpanded.set(false);
     }
+    stopTreeWatch();
     if (switchView) view.set(VIEW_DETAIL);
     const guard = detailRequestGuard.value;
     const generation = (Number(guard.generation) || 0) + 1;
     guard.generation = generation;
     try {
-      const detail = await api.inspectAgent(agentId);
-      if (guard.generation !== generation) return false;
-      selectedAgent.set(detail.agent || null);
-      const tree = await api.listTree({ agent_id: agentId });
-      if (guard.generation !== generation) return false;
-      const nextTreeNodes = Array.isArray(tree.nodes) ? tree.nodes : [];
-      treeNodes.set(nextTreeNodes);
-      const validExecutionIds = new Set(nextTreeNodes.map((node) => String(node && node.execution_id || "")).filter(Boolean));
-      expandedTreeTasks.set(Object.fromEntries(
-        Object.entries(expandedTreeTasks.value || {}).filter(([executionId, expanded]) => expanded === true && validExecutionIds.has(executionId))
-      ));
+      const snapshot = await refreshDetailSnapshot(agentId, () => guard.generation === generation, ipcCall);
+      if (!snapshot.loaded) return false;
+      const watchGuard = treeWatchGuard.value;
+      const watchGeneration = (Number(watchGuard.generation) || 0) + 1;
+      watchGuard.generation = watchGeneration;
+      watchGuard.revision = 0;
+      watchGuard.rootRunId = snapshot.rootRunId;
+      watchGuard.agentId = agentId;
+      detailLoading.set(false);
+      await watchDetailTree(agentId, snapshot.rootRunId, watchGeneration, ipcCall);
       return true;
     } catch (cause) {
       if (guard.generation === generation) error.set(errorText(cause));
@@ -1595,21 +1933,31 @@ function Screen(ctx) {
     }
   }
 
-  async function refreshAfterMutation(agentId) {
-    await refresh(true);
-    if (agentId) await loadDetail(agentId, true);
+  async function refreshAfterMutation(
+    agentId: unknown,
+    ipcCall: DashboardIpcCall,
+  ): Promise<void> {
+    await refresh(true, undefined, {}, ipcCall);
+    if (agentId) {
+      mutationLoading.set(false);
+      waitLoading.set(false);
+      await loadDetail(String(agentId), true, ipcCall);
+    }
   }
 
-  async function executeSpawn(payload) {
+  async function executeSpawn(
+    payload: DynamicRecord,
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ): Promise<void> {
     mutationLoading.set(true);
     clearFeedback();
     const entry = requestEntry("spawn", payload);
     try {
-      const result = await api.spawnAgent({ ...payload, request_id: entry.requestId });
+      const result = await api.spawnAgent({ ...payload, request_id: entry.requestId }, ipcCall);
       requestStatus("spawn", entry, "succeeded");
       notice.set(text.operationSucceeded);
       toast(text.operationSucceeded);
-      await refreshAfterMutation(result.agent && result.agent.id);
+      await refreshAfterMutation(asRecord(result.agent).id, ipcCall);
     } catch (cause) {
       requestStatus("spawn", entry, "unknown");
       error.set(errorText(cause));
@@ -1618,7 +1966,8 @@ function Screen(ctx) {
     }
   }
 
-  function submitSpawn() {
+  async function submitSpawn(): Promise<void> {
+    const ipcCall = captureIpcCall();
     clearFeedback();
     const input = {
       task: createTask.value,
@@ -1654,15 +2003,17 @@ function Screen(ctx) {
       confirmAction.set({
         kind: "spawn",
         payload,
-        warning: `${text.writeWarning}\n\n${payload.target_paths.join("\n")}`,
+        warning: `${text.writeWarning}\n\n${(payload.target_paths || []).join("\n")}`,
       });
       view.set(VIEW_CONFIRM);
       return;
     }
-    return executeSpawn(payload);
+    await executeSpawn(payload, ipcCall);
   }
 
-  async function executeMessage() {
+  async function executeMessage(
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ) {
     const agent = selectedAgent.value;
     const message = messageBody.value.trim();
     if (!agent || !message) {
@@ -1674,11 +2025,11 @@ function Screen(ctx) {
     const payload = { agent_id: agent.id, message };
     const entry = requestEntry("message", payload);
     try {
-      await api.sendMessage({ ...payload, request_id: entry.requestId });
+      await api.sendMessage({ ...payload, request_id: entry.requestId }, ipcCall);
       requestStatus("message", entry, "succeeded");
       messageBody.set("");
       notice.set(text.queuedMessage);
-      await refreshAfterMutation(agent.id);
+      await refreshAfterMutation(agent.id, ipcCall);
     } catch (cause) {
       requestStatus("message", entry, "unknown");
       error.set(errorText(cause));
@@ -1689,6 +2040,10 @@ function Screen(ctx) {
 
   function buildFollowup() {
     const agent = selectedAgent.value;
+    if (!agent) {
+      error.set(text.errors.agent_required);
+      return null;
+    }
     const input = {
       task: followTask.value,
       context: followContext.value,
@@ -1702,7 +2057,7 @@ function Screen(ctx) {
       error.set(validationText(text, validated.errors));
       return null;
     }
-    const payload = { agent_id: agent.id, task: input.task.trim(), context: input.context.trim() };
+    const payload: DynamicRecord = { agent_id: agent.id, task: input.task.trim(), context: input.context.trim() };
     if (validated.read_only !== undefined) payload.read_only = validated.read_only;
     if (validated.target_paths !== undefined) payload.target_paths = validated.target_paths;
     if (followMode.value === "write") {
@@ -1712,15 +2067,18 @@ function Screen(ctx) {
     return payload;
   }
 
-  async function executeFollowup(payload) {
+  async function executeFollowup(
+    payload: DynamicRecord,
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ): Promise<void> {
     mutationLoading.set(true);
     clearFeedback();
     const entry = requestEntry("followup", payload);
     try {
-      const result = await api.followupTask({ ...payload, request_id: entry.requestId });
+      const result = await api.followupTask({ ...payload, request_id: entry.requestId }, ipcCall);
       requestStatus("followup", entry, "succeeded");
       notice.set(text.operationSucceeded);
-      await refreshAfterMutation(result.agent && result.agent.id || payload.agent_id);
+      await refreshAfterMutation(asRecord(result.agent).id || payload.agent_id, ipcCall);
     } catch (cause) {
       requestStatus("followup", entry, "unknown");
       error.set(errorText(cause));
@@ -1729,14 +2087,17 @@ function Screen(ctx) {
     }
   }
 
-  function submitFollowup() {
+  async function submitFollowup(): Promise<void> {
+    const ipcCall = captureIpcCall();
     clearFeedback();
     const payload = buildFollowup();
     if (!payload) return;
-    const inheritsWrite = followMode.value === "inherit" && selectedAgent.value && !selectedAgent.value.read_only;
+    const selected = selectedAgent.value;
+    const inheritsWrite = followMode.value === "inherit" && !!selected && !selected.read_only;
     const specifiesWrite = followMode.value === "write";
     if (inheritsWrite || specifiesWrite) {
-      const paths = specifiesWrite ? payload.target_paths : selectedAgent.value.target_paths;
+      const rawPaths = specifiesWrite ? payload.target_paths : selected?.target_paths;
+      const paths = Array.isArray(rawPaths) ? rawPaths.map((path) => String(path)) : [];
       confirmAction.set({
         kind: "followup",
         payload,
@@ -1745,18 +2106,21 @@ function Screen(ctx) {
       view.set(VIEW_CONFIRM);
       return;
     }
-    executeFollowup(payload);
+    await executeFollowup(payload, ipcCall);
   }
 
-  async function executeInterrupt(payload) {
+  async function executeInterrupt(
+    payload: DynamicRecord,
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ): Promise<void> {
     mutationLoading.set(true);
     clearFeedback();
     const entry = requestEntry("interrupt", payload);
     try {
-      await api.interruptAgent({ ...payload, request_id: entry.requestId });
+      await api.interruptAgent({ ...payload, request_id: entry.requestId }, ipcCall);
       requestStatus("interrupt", entry, "succeeded");
       notice.set(text.operationSucceeded);
-      await refreshAfterMutation(payload.agent_id);
+      await refreshAfterMutation(payload.agent_id, ipcCall);
     } catch (cause) {
       requestStatus("interrupt", entry, "unknown");
       error.set(errorText(cause));
@@ -1765,15 +2129,17 @@ function Screen(ctx) {
     }
   }
 
-  async function waitForSelected() {
+  async function waitForSelected(
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ) {
     const agent = selectedAgent.value;
     if (!agent) return;
     waitLoading.set(true);
     clearFeedback();
     try {
-      const result = await api.waitAgent(agent.id, 5000);
+      const result = await api.waitAgent(agent.id, 5000, ipcCall);
       if (result.timed_out === true) notice.set(text.waitTimeout);
-      await refreshAfterMutation(agent.id);
+      await refreshAfterMutation(agent.id, ipcCall);
     } catch (cause) {
       error.set(errorText(cause));
     } finally {
@@ -1781,15 +2147,17 @@ function Screen(ctx) {
     }
   }
 
-  async function executeClearHistory() {
+  async function executeClearHistory(
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ) {
     mutationLoading.set(true);
     clearFeedback();
     try {
-      const result = await api.clearHistory();
+      const result = await api.clearHistory(ipcCall);
       notice.set(`${text.operationSucceeded} (${Number(result.deleted) || 0})`);
       toast(text.operationSucceeded);
       view.set(VIEW_LIST);
-      await refresh(true);
+      await refresh(true, undefined, {}, ipcCall);
     } catch (cause) {
       error.set(errorText(cause));
       view.set(VIEW_LIST);
@@ -1798,22 +2166,24 @@ function Screen(ctx) {
     }
   }
 
-  async function executeDeleteAgent(agentId) {
+  async function executeDeleteAgent(
+    agentId: string,
+    ipcCall: DashboardIpcCall = captureIpcCall(),
+  ): Promise<void> {
     mutationLoading.set(true);
     clearFeedback();
     try {
-      await api.deleteAgent(agentId);
+      await api.deleteAgent(agentId, ipcCall);
       const detailGuard = detailRequestGuard.value;
       detailGuard.generation = (Number(detailGuard.generation) || 0) + 1;
       selectedAgent.set(null);
       treeNodes.set([]);
       expandedTreeTasks.set({});
-      showResult.set(false);
       resultExpanded.set(false);
       notice.set(text.operationSucceeded);
       toast(text.operationSucceeded);
       view.set(VIEW_LIST);
-      await refresh(true);
+      await refresh(true, undefined, {}, ipcCall);
     } catch (cause) {
       error.set(errorText(cause));
       view.set(VIEW_DETAIL);
@@ -1822,16 +2192,88 @@ function Screen(ctx) {
     }
   }
 
-  function confirmPending() {
+  async function chooseToolPkgUpdate(): Promise<void> {
+    clearFeedback();
+    if (typeof ctx.openFilePicker !== "function" || typeof ctx.callTool !== "function") {
+      toast(text.errors.package_update_unsupported);
+      return;
+    }
+    packageUpdateLoading.set(true);
+    try {
+      const result = await ctx.openFilePicker({
+        mimeTypes: ["application/zip", "application/octet-stream", "*/*"],
+        allowMultiple: false,
+        persistPermission: false,
+      });
+      if (!result || result.cancelled === true || !Array.isArray(result.files) || result.files.length === 0) {
+        toast(text.packagePickerCancelled);
+        return;
+      }
+      const file = result.files[0];
+      if (!isToolPkgArchive(file)) {
+        toast(text.errors.package_file_invalid);
+        return;
+      }
+      const payload = buildToolPkgUpdatePayload(file);
+      if (!payload.source_path) {
+        toast(text.errors.package_file_path_missing);
+        return;
+      }
+      const sizeText = typeof payload.source_size === "number" ? ` (${payload.source_size} B)` : "";
+      confirmAction.set({
+        kind: "updateToolPkg",
+        payload,
+        warning: `${text.packageUpdateWarning}\n\n${text.packageSelected}: ${payload.source_name}${sizeText}`,
+        returnView: VIEW_LIST,
+      });
+      view.set(VIEW_CONFIRM);
+    } catch (cause) {
+      toast(errorText(cause));
+    } finally {
+      packageUpdateLoading.set(false);
+    }
+  }
+
+  async function executeToolPkgUpdate(payload: DynamicRecord): Promise<void> {
+    if (typeof ctx.callTool !== "function") {
+      toast(text.errors.package_update_unsupported);
+      view.set(VIEW_LIST);
+      return;
+    }
+    packageUpdateLoading.set(true);
+    packageUpdatePhase.set("copying");
+    clearFeedback();
+    view.set(VIEW_LIST);
+    try {
+      await ctx.callTool("copy_file", buildToolPkgCopyParams(payload));
+      packageUpdateLoading.set(false);
+      packageUpdatePhase.set("idle");
+      notice.set("");
+      await waitFor(0);
+      await ctx.callTool("send_broadcast", buildToolPkgBroadcastParams(payload));
+      toast(text.packageUpdateRequested);
+    } catch (cause) {
+      toast(errorText(cause));
+      notice.set("");
+      packageUpdatePhase.set("idle");
+      packageUpdateLoading.set(false);
+    }
+  }
+
+  async function confirmPending(): Promise<void> {
     const action = confirmAction.value;
     if (!action) return;
     confirmAction.set(null);
-    if (action.kind === "spawn") return executeSpawn(action.payload);
-    if (action.kind === "followup") return executeFollowup(action.payload);
-    if (action.kind === "interrupt") return executeInterrupt(action.payload);
-    if (action.kind === "clearHistory") return executeClearHistory();
-    if (action.kind === "deleteAgent") return executeDeleteAgent(action.payload.agent_id);
-    return undefined;
+    if (action.kind === "updateToolPkg") {
+      await executeToolPkgUpdate(action.payload);
+      return;
+    }
+    const ipcCall = captureIpcCall();
+    if (action.kind === "spawn") await executeSpawn(action.payload, ipcCall);
+    else if (action.kind === "followup") await executeFollowup(action.payload, ipcCall);
+    else if (action.kind === "interrupt") await executeInterrupt(action.payload, ipcCall);
+    else if (action.kind === "clearHistory") await executeClearHistory(ipcCall);
+    else if (action.kind === "deleteAgent") await executeDeleteAgent(String(action.payload.agent_id || ""), ipcCall);
   }
 
   function header() {
@@ -1850,10 +2292,11 @@ function Screen(ctx) {
     ];
   }
 
-  async function selectStatusFilter(value) {
-    const nextStatus = STATUS_FILTER_VALUES.includes(value) ? value : "";
+  async function selectStatusFilter(value: string): Promise<void> {
+    const ipcCall = captureIpcCall();
+    const nextStatus: string = STATUS_FILTER_VALUES.includes(value) ? value : "";
     statusFilter.set(nextStatus);
-    await refresh(true, nextStatus);
+    await refresh(true, nextStatus, {}, ipcCall);
   }
 
   function statusFilterControl() {
@@ -1861,7 +2304,7 @@ function Screen(ctx) {
       fillMaxWidth: true,
       spacing: 6,
     }, values.map((value) => ctx.UI.Button({
-      text: `${value === statusFilter.value ? "✓ " : ""}${text.statusOptions[value]}`,
+      text: `${value === statusFilter.value ? "✓ " : ""}${String(asRecord(text.statusOptions)[value] || value)}`,
       weight: 1,
       shape: SHAPE_PILL,
       contentPadding: { horizontal: 8, vertical: 7 },
@@ -1870,29 +2313,20 @@ function Screen(ctx) {
     return panel(ctx, [
       components.sectionTitle(ctx, text.statusFilter),
       ...rows,
-      ctx.UI.Row({ fillMaxWidth: true, spacing: 6 }, [
-        ctx.UI.Button({
-          text: `${statusFilter.value === "orphaned" ? "✓ " : ""}${text.statusOptions.orphaned}`,
-          weight: 1,
-          shape: SHAPE_PILL,
-          contentPadding: { horizontal: 8, vertical: 7 },
-          onClick: () => selectStatusFilter("orphaned"),
-        }),
-        ctx.UI.Button({
-          text: text.clearHistory,
-          weight: 1,
-          shape: SHAPE_PILL,
-          containerColor: "error",
-          contentColor: "onError",
-          contentPadding: { horizontal: 8, vertical: 7 },
-          enabled: !mutationLoading.value,
-          onClick: () => {
-            clearFeedback();
-            confirmAction.set({ kind: "clearHistory", payload: {}, warning: text.clearHistoryWarning, returnView: VIEW_LIST });
-            view.set(VIEW_CONFIRM);
-          },
-        }),
-      ]),
+      ctx.UI.Button({
+        text: text.clearHistory,
+        fillMaxWidth: true,
+        shape: SHAPE_PILL,
+        containerColor: "error",
+        contentColor: "onError",
+        contentPadding: { horizontal: 8, vertical: 7 },
+        enabled: !mutationLoading.value,
+        onClick: () => {
+          clearFeedback();
+          confirmAction.set({ kind: "clearHistory", payload: {}, warning: text.clearHistoryWarning, returnView: VIEW_LIST });
+          view.set(VIEW_CONFIRM);
+        },
+      }),
     ], { containerColor: "surfaceVariant", border: false, spacing: 8 });
   }
 
@@ -1901,27 +2335,27 @@ function Screen(ctx) {
       components.sectionTitle(ctx, text.globalSettings),
       components.textField(ctx, text.maxConcurrentAgents, globalMaxAgents, {
         singleLine: true,
-        placeholder: "1–16",
+        placeholder: "0 / 1-16",
       }),
       ctx.UI.Text({ text: text.maxConcurrentAgentsHint, style: "bodySmall", color: "onSurfaceVariant" }),
       components.textField(ctx, text.maxActiveRunsPerRoot, globalMaxActiveRunsPerRoot, {
         singleLine: true,
-        placeholder: "1–8",
+        placeholder: "0 / 1-8",
       }),
       ctx.UI.Text({ text: text.maxActiveRunsPerRootHint, style: "bodySmall", color: "onSurfaceVariant" }),
       components.textField(ctx, text.maxToolCalls, globalMaxTools, {
         singleLine: true,
-        placeholder: "1–64",
+        placeholder: "0 / 1-64",
       }),
       ctx.UI.Text({ text: text.maxToolCallsHint, style: "bodySmall", color: "onSurfaceVariant" }),
       components.textField(ctx, text.maxModelRetries, globalMaxModelRetries, {
         singleLine: true,
-        placeholder: "0–12",
+        placeholder: "-1 / 0-12",
       }),
       ctx.UI.Text({ text: text.maxModelRetriesHint, style: "bodySmall", color: "onSurfaceVariant" }),
       ctx.UI.Text({ text: text.conversationContext, style: "labelLarge", fontWeight: "semiBold" }),
       ctx.UI.Row({ fillMaxWidth: true, spacing: 6 }, ["off", "on", "auto"].map((mode) => ctx.UI.Button({
-        text: `${mode === conversationContextMode.value ? "✓ " : ""}${text.conversationContextOptions[mode]}`,
+        text: `${mode === conversationContextMode.value ? "✓ " : ""}${String(asRecord(text.conversationContextOptions)[mode] || mode)}`,
         weight: 1,
         shape: SHAPE_PILL,
         contentPadding: { horizontal: 8, vertical: 7 },
@@ -1934,11 +2368,27 @@ function Screen(ctx) {
     ], { spacing: 9 });
   }
 
+  function packageUpdateControl() {
+    return panel(ctx, [
+      components.sectionTitle(ctx, text.packageUpdate),
+      ctx.UI.Text({ text: text.packageUpdateHint, style: "bodySmall", color: "onSurfaceVariant", softWrap: true }),
+      packageUpdateLoading.value
+        ? components.loadingRow(ctx, text.packageUpdateSubmitting)
+        : ctx.UI.Button({
+          text: text.choosePackage,
+          fillMaxWidth: true,
+          shape: SHAPE_SMALL,
+          enabled: !mutationLoading.value,
+          onClick: chooseToolPkgUpdate,
+        }),
+    ], { spacing: 9, containerColor: "surfaceVariant" });
+  }
+
   function listView() {
     const nodes = [
       ...header(),
       ctx.UI.Row({ fillMaxWidth: true, spacing: 8 }, [
-        components.statCard(ctx, text.active, summary.value.active, "primaryContainer"),
+        components.statCard(ctx, text.running, summary.value.running, "primaryContainer"),
         components.statCard(ctx, text.queued, summary.value.queued, "secondaryContainer"),
         components.statCard(ctx, text.total, summary.value.total),
       ]),
@@ -1958,8 +2408,9 @@ function Screen(ctx) {
         }),
       ]),
       components.errorCard(ctx, error.value),
-      components.noticeCard(ctx, notice.value),
+      packageUpdateLoading.value ? null : components.noticeCard(ctx, notice.value),
       globalSettingsControl(),
+      packageUpdateControl(),
       statusFilterControl(),
     ];
     if (listLoading.value) nodes.push(components.loadingRow(ctx, text.loading));
@@ -1979,8 +2430,8 @@ function Screen(ctx) {
 
   function detailView() {
     const agent = selectedAgent.value;
-    const execution = agent && agent.execution || {};
-    const actions = allowedActions(agent && agent.status);
+    const execution = asRecord(agent?.execution);
+    const actions = allowedActions(agent?.status);
     const deleteButton = ctx.UI.Button({
       text: text.delete,
       shape: SHAPE_SMALL,
@@ -2001,7 +2452,7 @@ function Screen(ctx) {
       pageHeader(ctx, {
         back: text.back,
         label: agent && (agent.name || shortId(agent.id)) || text.details,
-      }, () => { clearFeedback(); view.set(VIEW_LIST); }, deleteButton),
+      }, () => { clearFeedback(); stopTreeWatch(); view.set(VIEW_LIST); }, deleteButton),
       components.errorCard(ctx, error.value),
       components.noticeCard(ctx, notice.value),
     ];
@@ -2024,14 +2475,23 @@ function Screen(ctx) {
         components.keyValue(ctx, text.modelRequestAttempts, execution.model_request_attempts || 0),
         components.keyValue(ctx, text.modelRetryCount, execution.model_retry_count || 0),
         components.keyValue(ctx, text.checkpointTurns, execution.checkpoint_turns || 0),
-        components.keyValue(ctx, text.currentActionGate,
-          execution.current_action_gate
-            ? `${execution.current_action_gate.kind}${Array.isArray(execution.current_action_gate.allowed_tools) && execution.current_action_gate.allowed_tools.length > 0 ? ` / ${execution.current_action_gate.allowed_tools.join(", ")}` : ""}`
-            : text.actionGateNone),
+        components.keyValue(ctx, text.currentActionGate, (() => {
+          const gate = asRecord(execution.current_action_gate);
+          const allowedTools = Array.isArray(gate.allowed_tools) ? gate.allowed_tools.map(String) : [];
+          return execution.current_action_gate
+            ? `${String(gate.kind || "")}${allowedTools.length > 0 ? ` / ${allowedTools.join(", ")}` : ""}`
+            : text.actionGateNone;
+        })()),
         components.keyValue(ctx, text.actionGateActivations, execution.action_gate_activation_count || 0),
         components.keyValue(ctx, text.actionGateBlocks, execution.action_gate_block_count || 0),
         components.keyValue(ctx, text.control, `${localizedOption(text.controlStatusOptions, execution.control_status, execution.control_status || "-")} / ${localizedOption(text.controlSourceOptions, execution.control_source, execution.control_source || "-")}`),
         components.keyValue(ctx, text.messages, `${text.queuedMessages}=${agent.pending_messages || 0}, ${text.deliveredMessages}=${agent.delivered_messages || 0}, ${text.acknowledgedMessages}=${agent.acknowledged_messages || 0}`),
+        (() => {
+          const watchRev = treeWatchGuard.value.revision;
+          return watchRev > 0
+            ? components.keyValue(ctx, text.streamRevision, watchRev)
+            : null;
+        })(),
       ], { spacing: 3 }),
       components.sectionTitle(ctx, text.permissions),
       components.noticeCard(ctx, permissionSummary(agent, text), agent.read_only ? "surfaceVariant" : "tertiaryContainer"),
@@ -2057,7 +2517,7 @@ function Screen(ctx) {
           ctx.UI.Column({ weight: 1, spacing: 3 }, [
             ctx.UI.Row({ fillMaxWidth: true, verticalAlignment: "center", spacing: 8 }, [
               ctx.UI.Text({
-                text: `${"  ".repeat(node.tree_depth || 0)}${node.name || shortId(node.agent_id)}`,
+                text: `${"  ".repeat(Number(node.tree_depth) || 0)}${node.name || shortId(node.agent_id)}`,
                 fontWeight: "semiBold",
                 weight: 1,
                 maxLines: 1,
@@ -2110,32 +2570,36 @@ function Screen(ctx) {
           view.set(VIEW_CONFIRM);
         } }) : null,
       ])),
-      ctx.UI.Button({
-        text: showResult.value ? text.hideResult : text.showResult,
-        fillMaxWidth: true,
-        onClick: () => {
-          const nextVisible = !showResult.value;
-          showResult.set(nextVisible);
-          if (nextVisible) resultExpanded.set(false);
-        },
-      })
+      components.sectionTitle(ctx, text.result),
+      resultView(
+        ctx,
+        agent.result || execution.result || agent.error || "",
+        text,
+        resultExpanded.value,
+        () => resultExpanded.set(!resultExpanded.value)
+      )
     );
-    if (showResult.value) {
+    const streamState = asRecord(execution.stream_state);
+    const streamStatus = String(streamState.status || "idle");
+    const streamPublicText = String(streamState.public_text || "").trim();
+    if (streamStatus === "streaming" && streamPublicText) {
       nodes.push(
-        components.sectionTitle(ctx, text.result),
-        resultView(
-          ctx,
-          agent.result || execution.result || agent.error || "",
-          text,
-          resultExpanded.value,
-          () => resultExpanded.set(!resultExpanded.value)
-        ),
-        components.sectionTitle(ctx, text.events)
+        components.sectionTitle(ctx, text.liveOutput),
+        panel(ctx, [
+          ctx.UI.Text({
+            text: streamPublicText,
+            style: "bodySmall",
+            color: "onSurface",
+            softWrap: true,
+          }),
+          ctx.UI.LinearProgressIndicator({ fillMaxWidth: true }),
+        ], { containerColor: "surfaceVariant", spacing: 6 }),
       );
-      const recentEvents = Array.isArray(agent.recent_events) ? agent.recent_events : [];
-      if (recentEvents.length === 0) nodes.push(emptyState(ctx, text.recentEventsEmpty));
-      else for (const event of [...recentEvents].reverse()) nodes.push(eventCard(ctx, event, text));
     }
+    nodes.push(components.sectionTitle(ctx, text.events));
+    const recentEvents = Array.isArray(agent.recent_events) ? agent.recent_events : [];
+    if (recentEvents.length === 0) nodes.push(emptyState(ctx, text.recentEventsEmpty));
+    else for (const event of [...recentEvents].reverse()) nodes.push(eventCard(ctx, event, text));
     return compact(nodes);
   }
 
@@ -2274,8 +2738,9 @@ function Screen(ctx) {
 
   return ctx.UI.LazyColumn({
     onLoad: async () => {
-      const loadSettingsPromise = loadGlobalSettings();
-      const refreshPromise = refresh(true, undefined, { initial: true });
+      const ipcCall = captureIpcCall();
+      const loadSettingsPromise = loadGlobalSettings(ipcCall);
+      const refreshPromise = refresh(true, undefined, { initial: true }, ipcCall);
       try {
         await loadSettingsPromise;
       } catch (cause) {
@@ -2289,8 +2754,20 @@ function Screen(ctx) {
   }, content);
 }
 
-module.exports = {
-  default: Screen,
-  Screen,
-  __test: { TEXT, failedResponseError, formatErrorText, markdownInlineText, parseMarkdownBlocks },
+const __test = {
+  TEXT,
+  TOOLPKG_UPDATE,
+  buildToolPkgBroadcastParams,
+  buildToolPkgCopyParams,
+  buildToolPkgUpdatePayload,
+  failedResponseError,
+  formatErrorText,
+  isToolPkgArchive,
+  markdownInlineText,
+  parseMarkdownBlocks,
+  pickedFileName,
 };
+
+export { Screen, __test };
+// Compose DSL discovers this self-contained dashboard through the default export.
+export default Screen;

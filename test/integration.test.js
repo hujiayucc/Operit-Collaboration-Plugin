@@ -1,7 +1,11 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
+
+const root = path.resolve(__dirname, "..");
 
 const handlers = new Map();
 const registeredHooks = {};
@@ -109,9 +113,9 @@ global.ToolPkg = {
   },
 };
 
-const plugin = require("../src/main.js");
-// main registers collaboration (6 public + 6 UI-only), probe (4), and gateway (3) IPC handlers.
-assert.equal(handlers.size, 19, "main must register collaboration, UI, settings, probe and gateway IPC handlers at module load");
+const plugin = require("../dist/main.js");
+// main registers collaboration (6 public + 7 UI-only), probe (4), and gateway (3) IPC handlers.
+assert.equal(handlers.size, 20, "main must register collaboration, UI, settings, probe and gateway IPC handlers at module load");
 assert.equal(typeof plugin.onPromptHistory, "function", "prompt history hook must be exported");
 assert.equal(typeof plugin.onToolPromptCompose, "function", "tool prompt hook must be exported");
 plugin.registerToolPkg();
@@ -122,9 +126,20 @@ assert.equal(typeof handlers.get("collaboration.update_settings"), "function");
 assert.equal(typeof handlers.get("collaboration.delete_agent"), "function");
 assert.equal(typeof handlers.get("collaboration.clear_history"), "function");
 assert.equal(registeredUiModules.length, 1);
-assert.equal(registeredUiModules[0].id, "collaboration_dashboard_v101");
+assert.equal(registeredUiModules[0].id, "collaboration_dashboard_v102");
 assert.equal(registeredUiModules[0].runtime, "compose_dsl");
 assert.equal(typeof registeredUiModules[0].screen, "function");
+
+test("compiled main passes the raw UI module require result to the resolver", () => {
+  const source = fs.readFileSync(path.join(root, "dist/main.js"), "utf8");
+  assert.match(
+    source,
+    /(?:const\s+|[;,]\s*)dashboardModule\s*=\s*require\("\.\/ui\/collaboration_dashboard\/index\.ui\.js"\)/,
+  );
+  assert.match(source, /resolveDashboardScreen\(dashboardModule\)/);
+  assert.doesNotMatch(source, /resolveDashboardScreen\([^)]*\.default\)/);
+});
+
 
 test("registration-mode UI placeholders keep their serializable module path", () => {
   function placeholderScreen() {}
